@@ -1,0 +1,252 @@
+# ===========================================================================
+# Profile (at-a-glance):
+#   Model:     Qwen3.8-27B (AutoRound INT4 — W4A16, ~18 GiB; hybrid GDN, 16
+#              full-attention layers interleaved with Gated DeltaNet linear
+#              attention. Vision tower present; text-only path exercised here.)
+#   Topology:  Dual 3090 PCIe (TP=2, no NVLink → custom all-reduce disabled)
+#   Drafter:   MTP n=4 built-in (--speculative-algorithm EAGLE, in-checkpoint
+#              head; NO external drafter model). Measured accept-len 2.3-3.4,
+#              accept-rate 0.44-0.80.
+#   KV:        fp8_e4m3
+#   Vision:    input path present (--image-processor-backend pil, see Caveats)
+#   Max ctx:   100K+ exercised; architectural ceiling not probed here
+#   Genesis:   N/A — Genesis is vLLM-specific
+#   Status:    🧪 Experimental
+#   Caveats:   Needs three vendored patches (applied in-container at startup)
+#              for the two scheduling flags this compose sets. Prefix-cache
+#              wipeouts on multi-session workloads are UNEXPLAINED and
+#              reproduce on vLLM too.
+# ---------------------------------------------------------------------------
+# HOW THIS WAS ARRIVED AT — read before copying any number
+#
+# Empirically, not analytically. The flag values here were found by trying
+# things against this rig and keeping what stopped hurting; they are NOT
+# derived from a model of how SGLang schedules, and no claim is made that they
+# are optimal or even well-understood. Several confident explanations were
+# formed along the way for the behaviour this config works around, and most of
+# them turned out to be wrong -- see README.md "What was tried and abandoned",
+# which lists them so the next person does not re-run them.
+#
+# What IS measured: the decode/accept numbers, which backends actually serve
+# which layers (the engine logs it), the GPU-0 preprocessing asymmetry, and
+# that the patches do not apply to v0.5.19. What is NOT: why the prefix cache
+# drops whole sessions, and where the ~2x wall-time gap against vLLM lives.
+#
+# Treat every value below as a starting point on one rig, not a recommendation.
+#
+# ---------------------------------------------------------------------------
+# Why this exists, and why it is NOT the 3.6 story
+#
+# models/qwen3.6-27b/sglang/ is PARKED, for three reasons. Two of them do not
+# apply to this model on this checkout, which is the whole reason this subtree
+# is separate rather than a copy:
+#
+#   3.6 parking reason                        | here
+#   ------------------------------------------|---------------------------------
+#   EAGLE-3 external drafter < native MTP     | N/A — this uses native MTP,
+#                                             | which that page's own numbers
+#                                             | put ahead of EAGLE-3 chain
+#   CUTE_DSL cuda-graph capture hang (v0.5.12)| does not reproduce on v0.5.18;
+#                                             | graphs capture and replay
+#                                             | (`cuda graph: True` in the
+#                                             | decode log)
+#   vLLM-MTP ~85 TPS vs SGLang 15-18 TPS      | that 15-18 was measured with
+#                                             | --disable-cuda-graph forced. With
+#                                             | graphs on, decode here is
+#                                             | ~80-104 tok/s at bs=1
+#
+# So the 3.6 verdict ("use vLLM") is not transferred by inheritance. What has
+# and has not been measured here is in README.md, including the open questions
+# this subtree exists to pin down.
+#
+# ---------------------------------------------------------------------------
+# The two scheduling flags, and why a patched SGLang is required
+#
+# Stock SGLang hands every scheduling pass to prefill whenever a prefill batch
+# exists, so one long prompt wins every pass until it completes and every
+# generating session stops for the duration. On a 114K prompt at 4096-token
+# chunks that is 28 passes -- about 95 seconds during which nothing else
+# decodes. That is the failure mode of multi-window coding use: one window
+# compacts, every other window freezes.
+#
+#   --long-prefill-token-threshold N   (upstream PR sgl-project/sglang#34623,
+#                                       NOT merged; backported to v0.5.18 by
+#                                       the fork below)
+#       Caps how much of the per-pass budget ONE request may take, so several
+#       requests can be mid-prefill at once instead of the first one draining
+#       the pool. Fixes prefill-vs-prefill starvation.
+#
+#   --decode-passes-per-prefill N      (fork-local, no upstream PR)
+#       Runs N decode passes between consecutive prefill passes. Fixes
+#       prefill-vs-decode starvation, which the threshold above does NOT
+#       touch: it changes how much a request takes per pass, not who gets the
+#       pass.
+#
+#       The unit is passes, and it has to be, twice over. A prefill pass runs
+#       ~3.4s against ~30ms for a decode pass, so useful values are tens, not
+#       fractions -- 1:1 alternation leaves decode about 1% of the clock. And
+#       every TP rank must reach the same verdict: an earlier revision decided
+#       from per-rank wall-clock, the accumulators drifted apart within
+#       seconds, and once the drift straddled the threshold one rank ran
+#       prefill while the other ran decode. Their collectives did not match
+#       and the job hung inside NCCL with both GPUs at 100% and nothing in the
+#       log.
+#
+# 50 is a starting point, not a tuned value: it was read off this rig's own
+# logs (~26 yields per prefill chunk measured ~27% of wall time for decode).
+# The scheduler logs the split it achieved -- tune against that, not against
+# this number.
+#
+# BOTH FLAGS ARE INERT AT THE SHIPPED --max-running-requests 1. They exist to
+# divide a pass between concurrent requests, and at 1 there is never a second
+# one to divide it with: nothing else is mid-prefill for the threshold to cap,
+# and the running batch is empty while a prefill runs, so the yield predicate
+# returns before it decides anything. They are set here because they are what
+# the patches are for and because raising the concurrency is the first thing
+# anyone will try -- not because they do anything at this value.
+#
+# Concurrency was 4 during development, against the ~440K-token KV pool this
+# compose's memory settings produce (it moved as --mem-fraction-static and the
+# rest were tuned -- it is a property of the settings, not the card). It is 1
+# here because at full context that pool does not hold two sessions, so 4 was
+# a testing value this hardware cannot honestly ship. Raise it -- and the two
+# flags start mattering -- only as far as the KV pool allows for the context
+# length actually being served.
+#
+# ---------------------------------------------------------------------------
+# Hardware constraints captured here:
+#   - 2x RTX 3090 Ampere sm_86 PCIe-only (no NVLink). Custom all-reduce
+#     disabled. See CLAUDE.md "Hardware truths".
+#   - flashinfer serves the 16 full-attention layers. The GDN linear-attention
+#     layers run Triton and cannot use flashinfer: its GDN kernels are
+#     SM90/SM100/SM103 only. Since most layers are GDN, changing
+#     --attention-backend moves a minority of the model.
+#   - --page-size 64 is required by --mamba-radix-cache-strategy extra_buffer
+#     (FLA chunk size 64). page-size 1 with extra_buffer boots but the
+#     checkpoint alignment it depends on does not hold.
+#
+# Prerequisites:
+#   1. Pull the pinned image:
+#        docker pull lmsysorg/sglang:v0.5.18
+#   2. AutoRound INT4 weights at $MODEL_DIR/qwen3.8-27b-autoround-int4/
+#      (the same path the vLLM composes in this model dir use).
+#   The three patches are applied inside the container at startup; nothing to
+#   install on the host.
+#
+# To run:
+#   cd <repo>/models/qwen3.8-27b/sglang/compose/dual/autoround-int4
+#   MODEL_DIR=/your/models/dir docker compose -f mtp.yml up -d
+# ===========================================================================
+# Hardware metadata (parsed by scripts/preflight.sh):
+# Requires-min-vram-gb: 24
+# Engine-profile: sglang-mtp
+# Requires-min-gpu-count: 2
+# Tensor-parallel: 2
+
+services:
+  sglang-qwen38-27b-mtp-dual:
+    # Pinned: we vendor context diffs against v0.5.18, and :latest is already
+    # past it -- as of 2026-09-04 :latest and :v0.5.19 share a digest
+    # (sha256:d6e72886...3eda9). AGENTS.md "Engine image pinning". install.sh
+    # refuses to apply against a tree it does not recognise rather than
+    # half-patching one, so a wrong tag fails at boot instead of at runtime.
+    image: "${SGLANG_IMAGE:-lmsysorg/sglang:v0.5.18}"
+    container_name: "${ESTATE_CONTAINER:-sglang-qwen38-27b-mtp-dual}"
+    restart: unless-stopped
+    ports:
+      - "${BIND_HOST:-0.0.0.0}:${ESTATE_PORT:-8042}:30000"
+    ipc: host
+    shm_size: "16g"
+    # py-spy needs this to read the scheduler's stack. The scheduler can wedge
+    # in ways that log nothing (see README "Open questions"), and without
+    # ptrace the only tool that answers is unavailable exactly when it is
+    # needed.
+    cap_add:
+      - SYS_PTRACE
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${ESTATE_GPUS:-0,1}"]
+              capabilities: [gpu]
+    volumes:
+      - "${MODEL_DIR:?MODEL_DIR is required}/${TARGET_DIR:-qwen3.8-27b-autoround-int4}:/models/target:ro"
+      - "../../../patches/sglang-v0518-scheduling-and-logging:/patches:ro"
+      # One directory for every JIT cache. SGLang points TRITON_CACHE_DIR,
+      # TORCHINDUCTOR_CACHE_DIR, CUDA_CACHE_PATH and FLASHINFER_WORKSPACE_BASE
+      # under this. Without it every restart re-runs nvcc, which on this rig is
+      # minutes, and the debug loop is restart-bound.
+      - "${SGLANG_CACHE_DIR:-../../../cache}:/root/.cache/sglang"
+    environment:
+      # Disable custom all-reduce on PCIe-only Ampere — see CLAUDE.md
+      NCCL_P2P_DISABLE: "${NCCL_P2P_DISABLE:-1}"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        bash /patches/install.sh
+        exec python3 -m sglang.launch_server "$$@"
+      - --
+      - --model-path=/models/target
+      - --served-model-name=qwen3.8-27b-autoround
+      - --trust-remote-code
+      - --tp-size=2
+      - --disable-custom-all-reduce
+      - --quantization=auto-round
+      - --dtype=bfloat16
+      # --- attention -------------------------------------------------------
+      # flashinfer for the 16 full-attention layers. The GDN layers stay on
+      # Triton regardless; see the header.
+      - --attention-backend=flashinfer
+      - --kv-cache-dtype=fp8_e4m3
+      # --- speculative decoding (built-in MTP head, no external drafter) ----
+      - --speculative-algorithm=EAGLE
+      - --speculative-num-steps=3
+      - --speculative-eagle-topk=1
+      - --speculative-num-draft-tokens=4
+      - --enable-linear-replayssm-spec
+      # --- hybrid GDN state cache ------------------------------------------
+      # extra_buffer requires page-size 64 (FLA chunk size). Both move together.
+      - --mamba-radix-cache-strategy=extra_buffer
+      - --page-size=64
+      - --max-mamba-cache-size=64
+      - --mamba-ssm-dtype=bfloat16
+      # --- scheduling (needs the patched fork) ------------------------------
+      - --chunked-prefill-size=4096
+      - --long-prefill-token-threshold=2048
+      - --decode-passes-per-prefill=50
+      # --- memory ----------------------------------------------------------
+      - --mem-fraction-static=0.90
+      - --max-running-requests=1
+      # nargs flag: the values must follow as separate words. `--flag=8` binds
+      # only the 8 and argparse then rejects the rest as unrecognised.
+      - --cuda-graph-bs-prefill
+      - "8"
+      - "16"
+      - "32"
+      - "64"
+      - "128"
+      - "256"
+      - "512"
+      - "1024"
+      - "2048"
+      - "4096"
+      # --- multimodal ------------------------------------------------------
+      # The fast (CUDA) image processor runs on GPU 0, alongside TP rank 0's
+      # weights, and OOMs there while GPU 1 still has headroom -- the asymmetry
+      # is the tell. pil keeps preprocessing off the GPU.
+      - --image-processor-backend=pil
+      # --- parsers / observability -----------------------------------------
+      - --reasoning-parser=qwen3
+      - --tool-call-parser=qwen3_coder
+      - --enable-cache-report
+      - --enable-strict-thinking
+      - --enable-metrics
+      # nargs flag — same rule as --cuda-graph-bs-prefill above.
+      - --uvicorn-access-log-exclude-prefixes
+      - /metrics
+      - /health
+      - --host=0.0.0.0
+      - --port=30000

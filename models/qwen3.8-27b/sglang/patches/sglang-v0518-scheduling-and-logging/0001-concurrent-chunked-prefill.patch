@@ -1,0 +1,1629 @@
+From: Aleksander Pejcic <apejcic@gmail.com>
+Date: Sat, 22 Aug 2026 10:30:14 +0200
+Subject: [PATCH] feat(scheduler): concurrent chunked prefill (CP) via --long-prefill-token-threshold (squashed, rebased on v0.5.18)
+
+Squash of the 8-commit concurrent-chunked-prefill stack (previously based on
+12a455a910) onto SGLang v0.5.18 (ff4c6e641d):
+  - skip every mid-prefill request when streaming, not just the last
+  - don't count a parked chunked request as in-flight
+  - derive contains_last_prefill_chunk from batch membership
+  - pluralize chunked_req to chunked_reqs at capacity 1
+  - enable concurrent chunked prefill via --long-prefill-token-threshold
+  - cover per-request EAGLE prefill tail-token substitution
+  - thread ceiling/capacity/reservation through ignore_eos prefill
+  - expose concurrent chunked prefill depth + cap on the unified path
+
+ring-pad backport (agent-patch-33872) intentionally excluded — fixed upstream.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+
+---
+diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disaggregation/decode.py
+index 8bb4f8b2a1..9e9c7dc2db 100644
+--- a/python/sglang/srt/disaggregation/decode.py
++++ b/python/sglang/srt/disaggregation/decode.py
+@@ -2154,7 +2154,7 @@ class SchedulerDisaggregationDecodeMixin:
+             self.running_batch = plan.running_batch
+             batch = plan.batch_to_run
+             batch = self.ngram_embedding_manager.prepare_for_forward(
+-                batch, chunked_req=self.chunked_req
++                batch, chunked_reqs=self.chunked_reqs
+             )
+             self.cur_batch_for_debug = batch
+ 
+@@ -2193,7 +2193,7 @@ class SchedulerDisaggregationDecodeMixin:
+             self.running_batch = plan.running_batch
+             batch = plan.batch_to_run
+             batch = self.ngram_embedding_manager.prepare_for_forward(
+-                batch, chunked_req=self.chunked_req
++                batch, chunked_reqs=self.chunked_reqs
+             )
+             self.cur_batch_for_debug = batch
+             # overlap + spec + grammar is unsupported (would desync DP ranks).
+@@ -2245,7 +2245,7 @@ class SchedulerDisaggregationDecodeMixin:
+         # Process pending prebuilt batch: output processing + filter + merge
+         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
+         if new_prebuilt_batch:
+-            assert self.chunked_req is None
++            assert not self.chunked_reqs
+             self.batch_result_processor.process_batch_result_prebuilt(
+                 new_prebuilt_batch
+             )
+diff --git a/python/sglang/srt/disaggregation/prefill.py b/python/sglang/srt/disaggregation/prefill.py
+index 5c44bb1eb6..81349380b9 100644
+--- a/python/sglang/srt/disaggregation/prefill.py
++++ b/python/sglang/srt/disaggregation/prefill.py
+@@ -585,7 +585,7 @@ class SchedulerDisaggregationPrefillMixin:
+             self.running_batch = plan.running_batch
+             batch = plan.batch_to_run
+             batch = self.ngram_embedding_manager.prepare_for_forward(
+-                batch, chunked_req=self.chunked_req
++                batch, chunked_reqs=self.chunked_reqs
+             )
+             self.cur_batch_for_debug = batch
+ 
+@@ -624,7 +624,7 @@ class SchedulerDisaggregationPrefillMixin:
+             self.running_batch = plan.running_batch
+             batch = plan.batch_to_run
+             batch = self.ngram_embedding_manager.prepare_for_forward(
+-                batch, chunked_req=self.chunked_req
++                batch, chunked_reqs=self.chunked_reqs
+             )
+             self.cur_batch_for_debug = batch
+ 
+@@ -774,10 +774,10 @@ class SchedulerDisaggregationPrefillMixin:
+                 req.inflight_middle_chunks -= 1
+ 
+                 # Still chunking iff its next chunk was launched: either it is
+-                # still self.chunked_req, or its final chunk (extend_range
+-                # reaching the end of the input) is in flight. A yielded req
+-                # is neither, so do its deferred release here.
+-                still_chunking = self.chunked_req is req or (
++                # still mid-prefill, or its final chunk (extend_range reaching
++                # the end of the input) is in flight. A yielded req is neither,
++                # so do its deferred release here.
++                still_chunking = req in self.chunked_reqs or (
+                     req.extend_range is not None
+                     and req.extend_range.end >= len(req.origin_input_ids)
+                 )
+@@ -1060,17 +1060,18 @@ class SchedulerDisaggregationPrefillMixin:
+         running_batch: ScheduleBatch,
+     ) -> None:
+         chunked_req_to_exclude = set()
+-        if (req := self.chunked_req) is not None:
++        yielded: List[Req] = []
++        for req in self.chunked_reqs:
+             chunked_req_to_exclude.add(req)
+             maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+ 
+             if not self.check_bootstrap(req):
+                 if is_aborted(req):
+                     # bootstrap failed
+-                    self.chunked_req = None
++                    yielded.append(req)
+                 elif self.has_bootstrapped_waiting_req():
+                     # optimistic request yields to waiting requests
+-                    self.chunked_req = None
++                    yielded.append(req)
+                     if not self.enable_overlap:
+                         self.optimistic_release_and_requeue(req)
+                 # else: still bootstrapping, keep computing without sending
+@@ -1083,14 +1084,16 @@ class SchedulerDisaggregationPrefillMixin:
+             else:
+                 self.send_kv_chunk(req)
+ 
+-            if self.chunked_req is not None:
+-                running_batch.batch_is_full = False
++        if yielded:
++            self.chunked_reqs = [r for r in self.chunked_reqs if r not in yielded]
++        if self.chunked_reqs:
++            running_batch.batch_is_full = False
+ 
+         if last_batch and last_batch.forward_mode.is_extend():
+-            if last_batch.chunked_req:
+-                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
+-                # We need to discard it.
+-                chunked_req_to_exclude.add(last_batch.chunked_req)
++            if last_batch.chunked_reqs:
++                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked reqs.
++                # We need to discard them.
++                chunked_req_to_exclude.update(last_batch.chunked_reqs)
+ 
+             last_bs = last_batch.batch_size()
+             last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
+diff --git a/python/sglang/srt/disaggregation/utils.py b/python/sglang/srt/disaggregation/utils.py
+index 96eaa1e5a3..328db60e78 100644
+--- a/python/sglang/srt/disaggregation/utils.py
++++ b/python/sglang/srt/disaggregation/utils.py
+@@ -122,7 +122,7 @@ def unified_memory_disagg_move_gate(scheduler):
+     transfer concludes, and for part of that lifetime the request is in NEITHER
+     end's queue -- so queue emptiness alone is not enough:
+ 
+-    - PREFILL: scheduling the final chunk clears `chunked_req` while earlier
++    - PREFILL: scheduling the final chunk drops it from `chunked_reqs` while earlier
+       chunks may still be draining, and the request only reaches the inflight
+       queue later, in the result path.
+     - DECODE: `pop_preallocated` publishes one request's destinations and keeps
+diff --git a/python/sglang/srt/dllm/mixin/scheduler.py b/python/sglang/srt/dllm/mixin/scheduler.py
+index abc4b3ed58..d40d31305b 100644
+--- a/python/sglang/srt/dllm/mixin/scheduler.py
++++ b/python/sglang/srt/dllm/mixin/scheduler.py
+@@ -327,7 +327,9 @@ class SchedulerDllmMixin:
+             req.init_next_round_input(self.tree_cache)
+             res = adder.add_one_req(
+                 req,
+-                has_chunked_req=True,
++                # DLLM manages its own staging queue and never claims a
++                # chunked slot from the adder.
++                num_chunked_reqs=1,
+                 truncation_align_size=self.truncation_align_size,
+             )
+ 
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 3ff2a29f3f..ad8b836bc2 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -60,6 +60,7 @@ from http import HTTPStatus
+ from typing import (
+     TYPE_CHECKING,
+     Any,
++    Collection,
+     Dict,
+     List,
+     Literal,
+@@ -1981,16 +1982,11 @@ def compute_extend_logprob_start_len(
+     return min(resolved_start - prefix_len, extend_len)
+ 
+ 
+-def _compute_chunked_req_next_prompt_token(
+-    chunked_req: Optional[Req],
+-    vocab_size: int,
+-) -> Optional[int]:
++def _next_prompt_token_after_fill(req: Req, vocab_size: int) -> Optional[int]:
+     """Return the next real prompt token after the fill boundary, skipping
+     multimodal placeholder (hash) tokens that lie outside the model vocab."""
+-    if chunked_req is None:
+-        return None
+-    fill_len = chunked_req.extend_range.end
+-    origin_ids = chunked_req.origin_input_ids
++    fill_len = req.extend_range.end
++    origin_ids = req.origin_input_ids
+     if fill_len >= len(origin_ids):
+         return None
+     if origin_ids[fill_len] < vocab_size:
+@@ -1998,6 +1994,31 @@ def _compute_chunked_req_next_prompt_token(
+     return None
+ 
+ 
++def _compute_chunked_next_prompt_tokens(
++    reqs: List[Req],
++    chunked_reqs: Optional[Collection[Req]],
++    vocab_size: int,
++) -> Optional[List[Optional[int]]]:
++    """Per-batch-row next prompt token, positionally aligned with ``reqs``.
++
++    Only mid-prefill requests get an entry; every other row is ``None``. EAGLE
++    uses it to keep the draft model's chain consistent across chunk boundaries
++    (see ``_eagle_prefill_tail_tokens`` and PR #26329): for a middle chunk the
++    true next token is the next *prompt* token, not the sampled one.
++
++    Returns ``None`` when no row needs a substitution, so the consumer can skip
++    the whole path.
++    """
++    if not chunked_reqs:
++        return None
++    mid_prefill = set(chunked_reqs)
++    tokens: List[Optional[int]] = [
++        _next_prompt_token_after_fill(req, vocab_size) if req in mid_prefill else None
++        for req in reqs
++    ]
++    return tokens if any(t is not None for t in tokens) else None
++
++
+ @dataclasses.dataclass
+ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+     """Store all information of a batch on the scheduler."""
+@@ -2027,9 +2048,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+     # This is an optimization to reduce the overhead of the prefill check.
+     batch_is_full: bool = False
+ 
+-    # For chunked prefill in PP
+-    chunked_req: Optional[Req] = None
+-    chunked_req_next_prompt_token: Optional[int] = None
++    # For chunked prefill in PP. `chunked_reqs` holds the requests in this
++    # batch whose prefill does not finish here; `chunked_next_prompt_tokens` is
++    # positionally aligned with `reqs` (None on rows that need no substitution,
++    # and None entirely when no row does).
++    chunked_reqs: Collection[Req] = ()
++    chunked_next_prompt_tokens: Optional[List[Optional[int]]] = None
+     contains_last_prefill_chunk: bool = True
+ 
+     # For DP attention
+@@ -2196,7 +2220,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         model_config: ModelConfig,
+         enable_overlap: bool,
+         spec_algorithm: SpeculativeAlgorithm,
+-        chunked_req: Optional[Req] = None,
++        chunked_reqs: Optional[Collection[Req]] = None,
+         dllm_config: Optional[DllmConfig] = None,
+     ):
+         return_logprob = any(req.return_logprob for req in reqs)
+@@ -2217,9 +2241,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             return_hidden_states=return_hidden_states_mode.need_capture(),
+             return_hidden_states_mode=return_hidden_states_mode,
+             is_prefill_only=all(req.is_prefill_only for req in reqs),
+-            chunked_req=chunked_req,
+-            chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
+-                chunked_req,
++            chunked_reqs=tuple(chunked_reqs or ()),
++            chunked_next_prompt_tokens=_compute_chunked_next_prompt_tokens(
++                reqs,
++                chunked_reqs,
+                 model_config.vocab_size,
+             ),
+             dllm_config=dllm_config,
+diff --git a/python/sglang/srt/managers/schedule_policy.py b/python/sglang/srt/managers/schedule_policy.py
+index 6780d914a8..4ceab6905e 100644
+--- a/python/sglang/srt/managers/schedule_policy.py
++++ b/python/sglang/srt/managers/schedule_policy.py
+@@ -499,6 +499,9 @@ class AddReqResult(Enum):
+     CONTINUE = auto()  # Continue to add requests
+     NO_TOKEN = auto()  # No token left
+     OTHER = auto()  # Other reasons to stop adding requests
++    # Not admitted, but only because the mid-prefill capacity is full; later
++    # waiting requests may still fit and must keep being considered.
++    SKIP = auto()
+ 
+ 
+ class PrefillAdder:
+@@ -520,6 +523,8 @@ class PrefillAdder:
+         dllm_config: Optional[DllmConfig] = None,
+         waiting_queue_len: int = 0,
+         prefill_tile_block_m: int = 64,
++        long_prefill_token_threshold: int = 0,
++        max_concurrent_chunked_reqs: int = 1,
+     ):
+         self.page_size = page_size
+         self.prefill_tile_block_m = prefill_tile_block_m
+@@ -542,7 +547,10 @@ class PrefillAdder:
+         self.req_states = None
+         self.can_run_list = []
+         self.preempt_list = []
+-        self.new_chunked_req = None
++        # Requests this pass leaves mid-prefill. The scheduler carries them
++        # to the next pass; `chunked_reqs_in_batch` is the subset that actually
++        # got a chunk here (a parked request is in neither list's intersection).
++        self.new_chunked_reqs: List[Req] = []
+         self.log_hit_tokens = 0
+         self.reprocessed_log_hit_tokens = 0
+         self.log_device_hit_tokens = 0
+@@ -615,6 +623,16 @@ class PrefillAdder:
+         # prefill pass. Used by PrefillDelayer's queue-based trigger.
+         self.waiting_queue_len = waiting_queue_len
+ 
++        # Per-request prefill ceiling (vLLM's long_prefill_token_threshold):
++        # no request takes more than this many prompt tokens in one pass, so
++        # up to chunked_prefill_size // threshold requests can be mid-prefill
++        # concurrently. 0 disables the cap (one request may drain the pool).
++        self.long_prefill_token_threshold = long_prefill_token_threshold
++        # How many requests may be mid-prefill at once. Mid-prefill requests
++        # pin their computed KV and cannot be retracted, so the bound also
++        # caps the reserved-but-uncomputed KV held for them.
++        self.max_concurrent_chunked_reqs = max_concurrent_chunked_reqs
++
+     def _admitted_extend_lens(self) -> List[int]:
+         return [int(getattr(req, "extend_input_len", 0)) for req in self.can_run_list]
+ 
+@@ -863,18 +881,34 @@ class PrefillAdder:
+         mamba_gap_reserve: int = 0,
+         host_hit_len: int = 0,
+         storage_hit_len: int = 0,
++        reserve_total_len: Optional[int] = None,
++        reserve_max_new_tokens: Optional[int] = None,
+     ):
+         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
+         extend_input_len = self.ceil_paged_tokens(extend_input_len)
+ 
+         # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
+         page_overhead = self.page_size
++        # Reserve-to-completion: a request left mid-prefill pins its computed
++        # KV and cannot be retracted, so its whole remaining prefill (plus
++        # decode headroom) is charged to the lifetime budget at admission --
++        # not chunk by chunk -- or later admissions can consume the headroom
++        # the request needs to finish and deadlock it. The per-pass budgets
++        # (cur_rem, rem_input, rem_chunk) still see only this pass's chunk.
++        # Defaults keep the non-reserving callers byte-identical.
++        reserve_len = (
++            extend_input_len
++            if reserve_total_len is None
++            else self.ceil_paged_tokens(reserve_total_len)
++        )
++        if reserve_max_new_tokens is None:
++            reserve_max_new_tokens = max_new_tokens
+         # `mamba_gap_reserve` (shared Mamba pool only; 0 otherwise) charges the new
+         # mamba state's shared-gap cost to BOTH full budgets: the slot is allocated
+         # immediately (counts against `cur_rem`) and held for the request lifetime
+         # (counts against `rem_total`). See `_mamba_gap_budget_for_req`.
+         self.rem_total_token_offset += (
+-            extend_input_len + max_new_tokens + page_overhead + mamba_gap_reserve
++            reserve_len + reserve_max_new_tokens + page_overhead + mamba_gap_reserve
+         )
+         self.cur_rem_token_offset += (
+             extend_input_len + page_overhead + mamba_gap_reserve
+@@ -994,6 +1028,23 @@ class PrefillAdder:
+             else AddReqResult.CONTINUE
+         )
+ 
++    def _reserve_completion_for_parked_req(self, req: Req) -> None:
++        """Hold a parked mid-prefill request's completion reservation.
++
++        A parked request gets no chunk this pass, but it stays mid-prefill
++        with its computed KV pinned and unretractable. Its whole remaining
++        prefill (plus decode headroom) must stay charged to the lifetime
++        budget, or admissions later in this pass could consume the headroom
++        it needs to finish and deadlock it.
++        """
++        remaining = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
++        self.rem_total_token_offset += (
++            self.ceil_paged_tokens(remaining)
++            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
++            + self.page_size
++            + self._mamba_gap_budget_for_req(req)
++        )
++
+     def add_chunked_req(self, req: Req):
+         if self.dllm_config is not None:
+             _rem_tokens = self._get_dllm_remain_tokens()
+@@ -1008,10 +1059,24 @@ class PrefillAdder:
+             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
+             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
+             if _rem_tokens <= 0:
++                if self.rem_chunk_tokens <= 0 and self.long_prefill_token_threshold > 0:
++                    # The per-pass chunk pool is drained (earlier requests
++                    # took it). Park the request: it stays carried and retries
++                    # next pass when the pool refills. It is NOT appended to
++                    # can_run_list, so inflight accounting skips it.
++                    self._reserve_completion_for_parked_req(req)
++                    return req
+                 if self.is_hybrid_swa:
++                    if self.long_prefill_token_threshold > 0:
++                        self._reserve_completion_for_parked_req(req)
+                     return req
+                 _rem_tokens = self.rem_chunk_tokens
+ 
++            # Per-request ceiling, applied to continued chunks as well: one
++            # carried request cannot drain the pool ahead of the others.
++            if self.long_prefill_token_threshold > 0:
++                _rem_tokens = min(_rem_tokens, self.long_prefill_token_threshold)
++
+         # A mid-chunk rank prefills this pass regardless of the delayer
+         # verdict, so report prefillable=True and ignore the result.
+         if self.prefill_delayer_single_pass is not None:
+@@ -1030,6 +1095,7 @@ class PrefillAdder:
+         new_len = min(cand_extend_input_len, _rem_tokens)
+         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
+         self.can_run_list.append(req)
++        reserving = self.long_prefill_token_threshold > 0 and self.dllm_config is None
+         self._update_prefill_budget(
+             0,
+             req.extend_range.length,
+@@ -1040,6 +1106,14 @@ class PrefillAdder:
+             ),
+             req.retracted_stain,
+             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
++            # Reserve-to-completion: the lifetime budget carries the whole
++            # remaining prefill + decode headroom, not just this chunk.
++            reserve_total_len=cand_extend_input_len if reserving else None,
++            reserve_max_new_tokens=(
++                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
++                if reserving
++                else None
++            ),
+         )
+ 
+         # Return if chunked prefill not finished
+@@ -1062,7 +1136,7 @@ class PrefillAdder:
+             else:
+                 self.tree_cache.dec_lock_ref(last_node)
+ 
+-    def add_one_req_ignore_eos(self, req: Req):
++    def add_one_req_ignore_eos(self, req: Req, num_chunked_reqs: int):
+         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
+             req.prefix_indices
+         )
+@@ -1141,6 +1215,15 @@ class PrefillAdder:
+         ):
+             return AddReqResult.OTHER
+ 
++        # The per-request ceiling composes with the ignore_eos path exactly as
++        # in add_one_req: applied before the chunked/non-chunked split, so a
++        # request under the ceiling still admits whole.
++        chunk_tokens_limit = self.rem_chunk_tokens
++        if self.long_prefill_token_threshold > 0 and chunk_tokens_limit is not None:
++            chunk_tokens_limit = min(
++                chunk_tokens_limit, self.long_prefill_token_threshold
++            )
++
+         if self.dllm_config is not None:
+             if self.rem_dllm_tokens <= 0:
+                 return AddReqResult.OTHER
+@@ -1152,8 +1235,8 @@ class PrefillAdder:
+ 
+             self._add_dllm_req(req, 0)
+         elif (
+-            self.rem_chunk_tokens is None  # chunked prefill is disabled
+-            or cand_extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
++            chunk_tokens_limit is None  # chunked prefill is disabled
++            or cand_extend_input_len <= chunk_tokens_limit  # it is the last chunk
+         ):
+             if (
+                 tile_stop := self._check_prefill_tile_budget(cand_extend_input_len)
+@@ -1173,11 +1256,20 @@ class PrefillAdder:
+                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+             )
+         else:
+-            if self.rem_chunk_tokens <= 0:
++            if chunk_tokens_limit <= 0:
+                 return AddReqResult.OTHER
+ 
++            # This request would be left mid-prefill. The capacity rule is the
++            # same as in add_one_req, and likewise gated on the ceiling so the
++            # disabled path is byte-identical.
++            if (
++                self.long_prefill_token_threshold > 0
++                and num_chunked_reqs >= self.max_concurrent_chunked_reqs
++            ):
++                return AddReqResult.SKIP
++
+             # Chunked prefill
+-            trunc_len = self.rem_chunk_tokens
++            trunc_len = chunk_tokens_limit
+ 
+             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
+                 return tile_stop
+@@ -1187,20 +1279,40 @@ class PrefillAdder:
+                 len(req.prefix_indices), len(req.prefix_indices) + trunc_len
+             )
+             self.can_run_list.append(req)
+-            self.new_chunked_req = req
++            self.new_chunked_reqs.append(req)
++            reserving = self.long_prefill_token_threshold > 0
+             self._update_prefill_budget(
+                 0,
+                 trunc_len,
+                 0,
+                 req.retracted_stain,
+                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
++                # Reserve-to-completion, as in add_one_req: the lifetime
++                # budget carries the whole remaining prefill + decode
++                # headroom from the first chunk on.
++                reserve_total_len=cand_extend_input_len if reserving else None,
++                reserve_max_new_tokens=(
++                    min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
++                    if reserving
++                    else None
++                ),
+             )
+ 
+         return self.budget_state()
+ 
+     def add_one_req(
+-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
++        self,
++        req: Req,
++        num_chunked_reqs: int,
++        truncation_align_size: Optional[int],
+     ):
++        """Admit one waiting request.
++
++        ``num_chunked_reqs`` is how many requests are already mid-prefill,
++        counting both those carried over from earlier passes and those this
++        pass has newly chunked. It bounds how many more may be left
++        mid-prefill; see ``max_concurrent_chunked_reqs``.
++        """
+         # TODO support cp with multiple requests
+         # Enabling context parallelism currently presents precision issues;
+         # therefore, the prefill-batch setting is temporarily set to 1.
+@@ -1211,7 +1323,7 @@ class PrefillAdder:
+             return AddReqResult.OTHER
+ 
+         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
+-            return self.add_one_req_ignore_eos(req)
++            return self.add_one_req_ignore_eos(req, num_chunked_reqs)
+ 
+         # Reserve page_size for page-alignment overhead: the paged allocator may
+         # consume one extra page per request (see alloc_extend), which
+@@ -1296,6 +1408,19 @@ class PrefillAdder:
+                         return AddReqResult.NO_TOKEN
+                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
+ 
++            if self.long_prefill_token_threshold > 0 and chunk_tokens_limit is not None:
++                # vLLM-compatible per-request ceiling: no request prefills
++                # more than the threshold in one pass, so up to
++                # chunked_prefill_size // threshold requests can be
++                # mid-prefill at once. Applied after the post-lock SWA
++                # re-check (the tighter cap wins) and before the
++                # chunked/non-chunked split, so a request whose whole
++                # remaining prompt fits under the threshold still admits
++                # whole rather than being chunked by the ceiling.
++                chunk_tokens_limit = min(
++                    chunk_tokens_limit, self.long_prefill_token_threshold
++                )
++
+             # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
+             # report not-prefillable via finalize()) and before init_load_back
+             # (a delay verdict must not start KV load-back).
+@@ -1383,6 +1508,22 @@ class PrefillAdder:
+                 if trunc_len <= 0:
+                     return AddReqResult.OTHER
+ 
++                # This request would be left mid-prefill. Mid-prefill
++                # requests pin their computed KV and cannot be retracted, so
++                # their count is a hard bound. When every slot is taken,
++                # refuse only THIS request and keep scanning the queue: a
++                # shorter prompt behind it may still fit whole. (Ordered
++                # after the trunc_len check so a drained pool still stops
++                # the pass with OTHER, and gated on the ceiling so the
++                # disabled path is byte-identical -- without the ceiling the
++                # single-slot invariant holds only as a side effect of the
++                # pool being drained.)
++                if (
++                    self.long_prefill_token_threshold > 0
++                    and num_chunked_reqs >= self.max_concurrent_chunked_reqs
++                ):
++                    return AddReqResult.SKIP
++
+                 # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
+                 # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
+                 # we need the prefill prefix length to be multiple of attention split size
+@@ -1412,9 +1553,10 @@ class PrefillAdder:
+                 )
+ 
+                 self.can_run_list.append(req)
+-                self.new_chunked_req = req
++                self.new_chunked_reqs.append(req)
+ 
+                 self._req_inc_lock_ref(req)
++                reserving = self.long_prefill_token_threshold > 0
+                 self._update_prefill_budget(
+                     prefix_len,
+                     trunc_len,
+@@ -1423,6 +1565,23 @@ class PrefillAdder:
+                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                     host_hit_len=req.host_hit_length,
+                     storage_hit_len=req.storage_hit_length,
++                    # Reserve-to-completion: the lifetime budget carries the
++                    # whole remaining prefill + decode headroom from the first
++                    # chunk on, so later admissions cannot consume the
++                    # headroom this request needs to finish.
++                    reserve_total_len=(
++                        len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
++                        if reserving
++                        else None
++                    ),
++                    reserve_max_new_tokens=(
++                        min(
++                            req.sampling_params.max_new_tokens,
++                            CLIP_MAX_NEW_TOKENS,
++                        )
++                        if reserving
++                        else None
++                    ),
+                 )
+ 
+         return self.budget_state()
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 7dc5be833f..65adb448c0 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -25,7 +25,18 @@ from collections import deque
+ from contextlib import contextmanager, nullcontext
+ from functools import partial
+ from http import HTTPStatus
+-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
++from typing import (
++    TYPE_CHECKING,
++    AbstractSet,
++    Any,
++    Deque,
++    Dict,
++    List,
++    Optional,
++    Set,
++    Tuple,
++    Union,
++)
+ 
+ from sglang.srt.runtime_context import (
+     attention_backends,
+@@ -614,6 +625,10 @@ class Scheduler(
+         # Init prefill-decodedisaggregation
+         self.init_disaggregation()
+ 
++        # Raise the mid-prefill capacity when the per-request prefill ceiling
++        # is enabled (needs dllm_config and disaggregation_mode to be set).
++        self.init_chunked_prefill_concurrency()
++
+         # Init overlap schedule
+         self.init_overlap()
+ 
+@@ -1175,8 +1190,15 @@ class Scheduler(
+             self.chunked_prefill_size = None
+         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
+             self.chunked_prefill_size = None
+-        self.chunked_req = None
+-        self._pending_chunked_abort_req = None
++        # Requests that are mid-prefill: admitted, partially prefilled, and
++        # carried across passes until their prefill completes. Ordered oldest
++        # first, so budget is handed out in admission order.
++        self.chunked_reqs: List[Req] = []
++        self._pending_chunked_abort_reqs: List[Req] = []
++        # Upper bound on how many requests may be mid-prefill at once. Raised
++        # above 1 only when the per-request prefill cap is enabled (see
++        # init_chunked_prefill_concurrency).
++        self.max_concurrent_chunked_reqs = 1
+         self.is_mixed_chunk = (
+             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
+         )
+@@ -1195,6 +1217,41 @@ class Scheduler(
+                 )
+                 self.enable_dynamic_chunking = False
+ 
++    def init_chunked_prefill_concurrency(self):
++        """Raise the mid-prefill capacity when the per-request ceiling is on.
++
++        With long_prefill_token_threshold F > 0, one pass hands at most F
++        prompt tokens to any single request, so up to
++        chunked_prefill_size // F requests can be mid-prefill at once
++        instead of one long prompt monopolizing the prefill budget.
++
++        Concurrency stays at 1 where the single-slot invariant is still
++        load-bearing: disagg prefill (the mixin shares this state and its KV
++        transfer bookkeeping assumes one in-flight chunk), PP > 1 (microbatch
++        accounting), and dLLM (the staging queue owns its mid-prefill
++        requests). Speculative decoding needs no gate: DSpark/EAGLE track
++        per-request state and never read the slot count.
++        """
++        threshold = get_schedule().long_prefill_token_threshold
++        if (
++            threshold <= 0
++            or self.chunked_prefill_size is None
++            or self.disaggregation_mode == DisaggregationMode.PREFILL
++            or self.ps.pp_size > 1
++            or self.dllm_config is not None
++        ):
++            return
++        self.max_concurrent_chunked_reqs = max(
++            1, self.chunked_prefill_size // threshold
++        )
++        if self.max_concurrent_chunked_reqs > 1:
++            logger.info(
++                f"Concurrent chunked prefill enabled: up to "
++                f"{self.max_concurrent_chunked_reqs} requests mid-prefill "
++                f"(chunked_prefill_size={self.chunked_prefill_size}, "
++                f"long_prefill_token_threshold={threshold})."
++            )
++
+     def init_metrics_reporter(
+         self, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
+     ) -> None:
+@@ -2124,7 +2181,7 @@ class Scheduler(
+             get_running_batch=lambda: self.running_batch,
+             get_waiting_queue=lambda: self.waiting_queue,
+             get_stats=lambda: self.metrics_reporter.stats,
+-            get_chunked_req=lambda: self.chunked_req,
++            get_chunked_reqs=lambda: self.chunked_reqs,
+             get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
+             get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
+             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
+@@ -2925,48 +2982,87 @@ class Scheduler(
+     def stash_chunked_request(self, req: Req):
+         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+ 
++    def _contains_last_prefill_chunk(self, can_run_list: List[Req]) -> bool:
++        """Whether any request in this batch consumes the sampled token.
++
++        False only for a batch of pure middle chunks, whose sampled tokens
++        nobody reads -- the case that lets PP skip output communication
++        entirely (`_pp_can_skip_output_comm`).
++
++        Derived from batch membership rather than from the batch size. The
++        former `len(can_run_list) != 1` was a proxy for "the chunked request is
++        the sole member" and misreads the parked case: a request is mid-prefill
++        but was not admitted to the batch (see `_count_inflight_chunk`), so the
++        one request present does finish its prefill and does consume its token.
++        """
++        mid_prefill = set(self.chunked_reqs)
++        return any(req not in mid_prefill for req in can_run_list)
++
++    def _count_inflight_chunk(self, batch_reqs: AbstractSet[Req]) -> None:
++        """Mark mid-prefill requests as having a chunk in flight this batch.
++
++        Only counts chunks that are actually in the batch. `add_chunked_req`
++        can *park* a request instead of prefilling it -- the hybrid-SWA branch
++        returns it without appending it to `can_run_list` when the SWA pool
++        cannot fit another page. A parked request produces no forward result,
++        so `process_batch_result_prefill` never runs the matching decrement;
++        the counter would ratchet up once per pass and a request stuck above
++        zero is treated as a middle chunk forever, never appending a token and
++        never finishing.
++
++        This mirrors the parked-chunk gate on the stash path in
++        `get_next_batch_to_run` (`extend_range.end > len(prefix_indices)`),
++        which detects the same condition from the request's own state.
++        """
++        for req in self.chunked_reqs:
++            if req in batch_reqs:
++                req.inflight_middle_chunks += 1
++
+     def process_pending_chunked_abort(self) -> None:
+         """Abort an in-flight chunked-prefill request once it is safe to do so.
+ 
+-        ``abort_request`` only records the target in ``_pending_chunked_abort_req``
+-        (tearing it down mid-iteration is unsafe). Clearing ``chunked_req`` here at
+-        the top of the scheduling step stops the next chunk from launching; the
+-        chunk already launched is drained when its result is resolved. Under overlap
+-        the result lands a step later, so the batch-result processors keep
+-        ``inflight_middle_chunks`` accounting intact and skip the aborted chunk:
+-        ``process_batch_result_disagg_prefill`` via its ``is_aborted`` drop, and
+-        ``process_batch_result_prefill`` via its chunked branch (the finished req
+-        is excluded from streaming and its logprob offset is still accounted).
+-        Mirrors ``handle_bootstrap_failure``.
++        ``abort_request`` only records the targets in ``_pending_chunked_abort_reqs``
++        (tearing them down mid-iteration is unsafe). Dropping a request from
++        ``chunked_reqs`` here at the top of the scheduling step stops its next
++        chunk from launching; the chunk already launched is drained when its
++        result is resolved. Under overlap the result lands a step later, so the
++        batch-result processors keep ``inflight_middle_chunks`` accounting intact
++        and skip the aborted chunk: ``process_batch_result_disagg_prefill`` via
++        its ``is_aborted`` drop, and ``process_batch_result_prefill`` via its
++        chunked branch (the finished req is excluded from streaming and its
++        logprob offset is still accounted). Mirrors ``handle_bootstrap_failure``.
+         """
+-        req = self._pending_chunked_abort_req
+-        if req is None:
+-            return
+-        if self.chunked_req is not req:
+-            # Already past chunked prefill; the running-batch abort path handles
+-            # it. Drop the marker once the request is actually gone.
+-            if req.finished() or req.req_pool_idx is None:
+-                self._pending_chunked_abort_req = None
++        if not self._pending_chunked_abort_reqs:
+             return
+ 
+-        prepare_abort(req, "Aborted")
+-        req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
+-        req.to_finish = None
+-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+-            self.clear_pending_chunk_send(req)
+-            req.disagg_kv_sender.abort()
+-            maybe_release_metadata_buffer(
+-                req, self.req_to_metadata_buffer_idx_allocator
+-            )
+-            req.pending_bootstrap = False
+-        if self.enable_hicache_storage:
+-            self.tree_cache.release_aborted_request(req.rid)
+-        release_kv_cache(req, self.tree_cache, is_insert=False)
++        still_pending: List[Req] = []
++        for req in self._pending_chunked_abort_reqs:
++            if req not in self.chunked_reqs:
++                # Already past chunked prefill; the running-batch abort path
++                # handles it. Keep the marker until the request is really gone.
++                if not (req.finished() or req.req_pool_idx is None):
++                    still_pending.append(req)
++                continue
+ 
+-        self.chunked_req = None
+-        self._pending_chunked_abort_req = None
+-        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+-        logger.debug(f"Abort chunked prefill request. {req.rid=}")
++            prepare_abort(req, "Aborted")
++            req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
++            req.to_finish = None
++            if self.disaggregation_mode == DisaggregationMode.PREFILL:
++                self.clear_pending_chunk_send(req)
++                req.disagg_kv_sender.abort()
++                maybe_release_metadata_buffer(
++                    req, self.req_to_metadata_buffer_idx_allocator
++                )
++                req.pending_bootstrap = False
++            if self.enable_hicache_storage:
++                self.tree_cache.release_aborted_request(req.rid)
++            release_kv_cache(req, self.tree_cache, is_insert=False)
++
++            self.chunked_reqs.remove(req)
++            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
++            logger.debug(f"Abort chunked prefill request. {req.rid=}")
++
++        self._pending_chunked_abort_reqs = still_pending
+ 
+     def _build_hisparse_decode_batch(self, reqs):
+         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
+@@ -3038,18 +3134,18 @@ class Scheduler(
+                 else:
+                     self.stash_chunked_request(req)
+ 
+-        if self.chunked_req is not None:
+-            # Move the chunked request out of the batch so that we can merge
++        for chunked_req in self.chunked_reqs:
++            # Move mid-prefill requests out of the batch so that we can merge
+             # only finished requests to running_batch.
+-            chunked_req_to_exclude.add(self.chunked_req)
++            chunked_req_to_exclude.add(chunked_req)
+ 
+             # Stash (cache) the previous chunk only when it produced new KV
+             # beyond what is already cached. A parked chunk (add_chunked_req
+             # hybrid-SWA early-return) leaves extend_range.end ==
+             # len(prefix_indices), so there is nothing new to cache and
+             # stashing would be a no-op.
+-            if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
+-                self.stash_chunked_request(self.chunked_req)
++            if chunked_req.extend_range.end > len(chunked_req.prefix_indices):
++                self.stash_chunked_request(chunked_req)
+ 
+         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
+         if self.enable_hisparse:
+@@ -3069,10 +3165,10 @@ class Scheduler(
+             and last_batch
+             and last_batch.forward_mode.is_extend()
+         ):
+-            if last_batch.chunked_req is not None:
+-                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
+-                # We need to discard it.
+-                chunked_req_to_exclude.add(last_batch.chunked_req)
++            if last_batch.chunked_reqs:
++                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked reqs.
++                # We need to discard them.
++                chunked_req_to_exclude.update(last_batch.chunked_reqs)
+ 
+             if self.dllm_config is not None and last_batch.reqs:
+                 chunked_req_to_exclude.update(last_batch.reqs)
+@@ -3139,7 +3235,7 @@ class Scheduler(
+ 
+         # Handle ngram embedding
+         ret = self.ngram_embedding_manager.prepare_for_forward(
+-            ret, chunked_req=self.chunked_req
++            ret, chunked_reqs=self.chunked_reqs
+         )
+ 
+         if ret:
+@@ -3201,14 +3297,14 @@ class Scheduler(
+ 
+         if (
+             running_batch.batch_is_full or len(self.waiting_queue) == 0
+-        ) and self.chunked_req is None:
++        ) and not self.chunked_reqs:
+             return None, running_batch
+ 
+         running_bs = len(running_batch.reqs)
+         # Skipped during a chunked prefill: that pass must proceed regardless.
+         if (
+             self.min_free_slots_delayer is not None
+-            and self.chunked_req is None
++            and not self.chunked_reqs
+             and self.min_free_slots_delayer.should_delay(
+                 running_bs=running_bs,
+                 num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
+@@ -3216,14 +3312,14 @@ class Scheduler(
+         ):
+             return None, running_batch
+ 
+-        # Ignore the check if self.chunked_req is not None.
+-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
++        # Ignore the check if any request is mid-prefill.
++        # In the non-PP case, when a request is mid-prefill, num_allocatable_reqs should always be greater than 0,
+         # as the space for the chunked requests has just been released.
+         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
+         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
+         if (
+             self.get_num_allocatable_reqs(running_bs) <= 0
+-            and self.chunked_req is None
++            and not self.chunked_reqs
+             and not self.enable_priority_preemption
+         ):
+             running_batch.batch_is_full = True
+@@ -3240,8 +3336,12 @@ class Scheduler(
+ 
+         # Determine chunked_prefill_size for this batch
+         chunked_prefill_size = self.chunked_prefill_size
+-        if self.chunked_req is not None and self.enable_dynamic_chunking:
+-            history_len = len(self.chunked_req.prefix_indices)
++        if self.chunked_reqs and self.enable_dynamic_chunking:
++            # Size the batch for the request that has made the least progress:
++            # the predictor maps history length to a chunk size that keeps step
++            # time even, and the shortest history is the most expensive chunk.
++            # (Dynamic chunking is PP-only, where concurrency stays at 1.)
++            history_len = min(len(r.prefix_indices) for r in self.chunked_reqs)
+             dynamic_size = self.predict_next_chunk_size(history_len)
+             if dynamic_size is not None:
+                 chunked_prefill_size = dynamic_size
+@@ -3271,11 +3371,19 @@ class Scheduler(
+             dllm_config=self.dllm_config,
+             waiting_queue_len=len(self.waiting_queue),
+             prefill_tile_block_m=prefill_tile_block_m,
++            long_prefill_token_threshold=get_schedule().long_prefill_token_threshold,
++            max_concurrent_chunked_reqs=self.max_concurrent_chunked_reqs,
+         )
+ 
+-        if self.chunked_req is not None:
+-            self.chunked_req.init_next_round_input()
+-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
++        # Re-admit the requests carried over from earlier passes, oldest first,
++        # so the longest-waiting prefill keeps priority on the budget. A
++        # request whose prefill finishes here drops out of the carried set.
++        carried_over, self.chunked_reqs = self.chunked_reqs, []
++        for chunked_req in carried_over:
++            chunked_req.init_next_round_input()
++            still_chunked = adder.add_chunked_req(chunked_req)
++            if still_chunked is not None:
++                self.chunked_reqs.append(still_chunked)
+ 
+         if self.enable_lora:
+             running_loras = {
+@@ -3327,7 +3435,7 @@ class Scheduler(
+             req.init_next_round_input(self.tree_cache)
+             res = adder.add_one_req(
+                 req,
+-                has_chunked_req=(self.chunked_req is not None),
++                num_chunked_reqs=len(self.chunked_reqs) + len(adder.new_chunked_reqs),
+                 truncation_align_size=self.truncation_align_size,
+             )
+ 
+@@ -3360,6 +3468,12 @@ class Scheduler(
+                             req.mamba_pool_idx.unsqueeze(-1)
+                         )
+                         req.mamba_pool_idx = None
++                if res == AddReqResult.SKIP:
++                    # Only the mid-prefill capacity is full; later waiting
++                    # requests may still fit and must keep being considered.
++                    if self.metrics_reporter.enable_metrics:
++                        self.metrics_collector.increment_chunked_prefill_capacity_skipped()
++                    continue
+                 break
+ 
+         if mamba_allocator is not None:
+@@ -3376,13 +3490,19 @@ class Scheduler(
+             for req in adder.preempt_list:
+                 self._add_request_to_queue(req)
+ 
+-        if adder.new_chunked_req is not None:
+-            # Update chunked prefill
+-            assert self.chunked_req is None
+-            self.chunked_req = adder.new_chunked_req
++        # Requests newly left mid-prefill by this pass join the carried set.
++        # The adder never hands back more than the capacity it was given, so
++        # the bound holds without a further check here.
++        assert (
++            len(self.chunked_reqs) + len(adder.new_chunked_reqs)
++            <= self.max_concurrent_chunked_reqs
++        ), (
++            f"chunked prefill over capacity: {len(self.chunked_reqs)} carried + "
++            f"{len(adder.new_chunked_reqs)} new > {self.max_concurrent_chunked_reqs}"
++        )
++        self.chunked_reqs.extend(adder.new_chunked_reqs)
+ 
+-        if self.chunked_req is not None:
+-            self.chunked_req.inflight_middle_chunks += 1
++        self._count_inflight_chunk(can_run_set)
+ 
+         set_time_batch(can_run_list, "set_forward_entry_time")
+ 
+@@ -3395,11 +3515,11 @@ class Scheduler(
+             self.model_config,
+             self.enable_overlap,
+             self.spec_algorithm,
+-            chunked_req=self.chunked_req,
++            chunked_reqs=self.chunked_reqs,
+         )
+ 
+-        new_batch.contains_last_prefill_chunk = (
+-            self.chunked_req is None or len(can_run_list) != 1
++        new_batch.contains_last_prefill_chunk = self._contains_last_prefill_chunk(
++            can_run_list
+         )
+ 
+         if self.enable_hierarchical_cache:
+@@ -3420,11 +3540,7 @@ class Scheduler(
+             running_batch.reqs,
+             self.enable_priority_scheduling,
+             num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
+-                chunk_deduct=(
+-                    self.chunked_req.extend_range.length
+-                    if self.chunked_req is not None
+-                    else 0
+-                ),
++                chunk_deduct=(sum(r.extend_range.length for r in self.chunked_reqs)),
+             ),
+         )
+ 
+@@ -3442,6 +3558,10 @@ class Scheduler(
+                 running_batch.prepare_for_decode()
+                 new_batch.mix_with_running(running_batch)
+                 new_batch.decoding_reqs = running_batch.reqs
++                # Decode requests are merged in after the flag was computed
++                # above, and every one of them consumes the sampled token, so
++                # the batch is no longer pure middle chunks.
++                new_batch.contains_last_prefill_chunk = True
+             running_batch = ScheduleBatch(
+                 reqs=[], batch_is_full=running_batch.batch_is_full
+             )
+@@ -4089,7 +4209,7 @@ class Scheduler(
+         # Batch running status
+         idle = (
+             self.running_batch.is_empty()
+-            and self.chunked_req is None
++            and not self.chunked_reqs
+             and not self.dllm_manager.any_staging_reqs()
+             and (self.last_batch is None or self.last_batch.is_empty())
+             and (not self.enable_overlap or len(self.result_queue) == 0)
+@@ -4440,9 +4560,10 @@ class Scheduler(
+         return RpcReqOutput(success=success, message="" if not exec else str(exec))
+ 
+     def abort_request(self, recv_req: AbortReq):
+-        if (chunked_req := self.chunked_req) is not None:
++        for chunked_req in self.chunked_reqs:
+             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+-                self._pending_chunked_abort_req = chunked_req
++                if chunked_req not in self._pending_chunked_abort_reqs:
++                    self._pending_chunked_abort_reqs.append(chunked_req)
+ 
+         # todo hisparse, release resources for abort requests in hisparse coordinator
+         # Delete requests in the waiting queue
+@@ -4612,13 +4733,10 @@ class Scheduler(
+         ):
+             retract_reqs += [r for r in self.last_batch.reqs if not r.finished()]
+ 
+-        if (
+-            self.chunked_req is not None
+-            and not self.chunked_req.finished()
+-            and self.chunked_req not in retract_reqs
+-            and self.disaggregation_mode != DisaggregationMode.PREFILL
+-        ):
+-            retract_reqs.append(self.chunked_req)
++        if self.disaggregation_mode != DisaggregationMode.PREFILL:
++            for chunked_req in self.chunked_reqs:
++                if not chunked_req.finished() and chunked_req not in retract_reqs:
++                    retract_reqs.append(chunked_req)
+ 
+         self.last_batch = None
+         self.cur_batch_for_debug = None
+@@ -4648,14 +4766,14 @@ class Scheduler(
+             else:
+                 self._add_request_to_queue(req)
+         self.running_batch.batch_is_full = False
+-        # In disagg-PREFILL, keep a live mid-chunk chunked_req rather than retract it:
++        # In disagg-PREFILL, keep live mid-chunk requests rather than retract them:
+         # freeing its KV under a live disagg KV-sender crashes pop_bootstrapped or
+         # sends freed/reused KV to decode. Kept, it resumes prefill after the pause.
+         # TODO(disagg-prefill-retract): tear the sender down (abort + release metadata
+         # buffer + reset pending_bootstrap) before freeing KV, then retract for real.
+         # Until then a weight-update pause leaves stale-weight prefix KV (off-policy).
+         if self.disaggregation_mode != DisaggregationMode.PREFILL:
+-            self.chunked_req = None
++            self.chunked_reqs = []
+ 
+         # Surface the paused state to dashboards immediately. The scheduler
+         # event loop short-circuits before reaching ``on_idle`` while paused,
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index 024781c37e..6310733d00 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -195,7 +195,10 @@ class SchedulerBatchResultProcessor:
+         batch: ScheduleBatch,
+         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+     ):
+-        skip_stream_req = None
++        # Requests whose prefill did not finish in this batch. A batch can hold
++        # several of them (DLLM stages many at once; concurrent chunked prefill
++        # does so in general), so this is a list rather than a single request.
++        skip_stream_reqs: List[Req] = []
+         self.token_to_kv_pool_allocator.free_group_begin()
+ 
+         if self.is_generation:
+@@ -307,10 +310,10 @@ class SchedulerBatchResultProcessor:
+                 else:
+                     # being chunked reqs' prefill is not finished
+                     req.inflight_middle_chunks -= 1
+-                    # There is only at most one request being currently chunked.
+-                    # Because this request does not finish prefill,
+-                    # we don't want to stream the request currently being chunked.
+-                    skip_stream_req = req
++                    # This request did not finish prefill, so it appended no new
++                    # token: streaming it would emit a duplicate. Collect every
++                    # such request — a batch may contain more than one.
++                    skip_stream_reqs.append(req)
+ 
+                     # Incrementally update input logprobs.
+                     if batch.return_logprob:
+@@ -364,7 +367,7 @@ class SchedulerBatchResultProcessor:
+ 
+         self.token_to_kv_pool_allocator.free_group_end()
+         self.output_streamer.stream_output(
+-            batch.reqs, batch.return_logprob, skip_stream_req
++            batch.reqs, batch.return_logprob, skip_stream_reqs
+         )
+ 
+         can_run_cuda_graph = result.can_run_cuda_graph
+diff --git a/python/sglang/srt/managers/scheduler_components/load_inquirer.py b/python/sglang/srt/managers/scheduler_components/load_inquirer.py
+index 988b41c676..ace84d62e2 100644
+--- a/python/sglang/srt/managers/scheduler_components/load_inquirer.py
++++ b/python/sglang/srt/managers/scheduler_components/load_inquirer.py
+@@ -44,7 +44,7 @@ class SchedulerLoadInquirer:
+     get_running_batch: Callable
+     get_waiting_queue: Callable
+     get_stats: Callable
+-    get_chunked_req: Callable
++    get_chunked_reqs: Callable
+     get_disagg_prefill_bootstrap_queue: Callable
+     get_disagg_prefill_inflight_queue: Callable
+     get_disagg_decode_prealloc_queue: Callable
+@@ -70,9 +70,11 @@ class SchedulerLoadInquirer:
+                 0 is correct.
+         """
+         num_pending_tokens = sum(req.seqlen for req in self.get_waiting_queue())
+-        if self.get_chunked_req() is not None:
+-            req = self.get_chunked_req()
+-            num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
++        for req in self.get_chunked_reqs():
++            num_pending_tokens += req.seqlen - len(req.prefix_indices)
++        # `chunk_deduct` covers the chunks already planned for this pass across
++        # all mid-prefill requests, so subtract it once.
++        num_pending_tokens -= chunk_deduct
+         return num_pending_tokens
+ 
+     def get_num_waiting_uncached_tokens(self) -> int:
+@@ -83,8 +85,7 @@ class SchedulerLoadInquirer:
+         for req in self.get_waiting_queue():
+             # if match-in-waiting-queue disabled, this metric returns seq_lens
+             num_tokens += max(0, req.seqlen - req.num_matched_prefix_tokens)
+-        cr = self.get_chunked_req()
+-        if cr is not None:
++        for cr in self.get_chunked_reqs():
+             num_tokens += max(0, cr.seqlen - len(cr.prefix_indices))
+         return num_tokens
+ 
+diff --git a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+index 0f4ad921bc..774b741053 100644
+--- a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
++++ b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+@@ -679,6 +679,12 @@ class SchedulerMetricsReporter:
+             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
+             self.stats.cache_hit_rate = cache_hit_rate
+ 
++            # Concurrent chunked prefill: mid-prefill depth + configured cap.
++            self.stats.num_chunked_prefill_reqs = len(self.scheduler.chunked_reqs)
++            self.stats.max_concurrent_chunked_reqs = (
++                self.scheduler.max_concurrent_chunked_reqs
++            )
++
+             # Memory pool usage ratios / Absolute token counts
+             pool_stats.update_scheduler_stats(self.stats)
+ 
+diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py b/python/sglang/srt/managers/scheduler_components/output_streamer.py
+index 18a42407af..d3d28e854d 100644
+--- a/python/sglang/srt/managers/scheduler_components/output_streamer.py
++++ b/python/sglang/srt/managers/scheduler_components/output_streamer.py
+@@ -6,6 +6,7 @@ from typing import (
+     TYPE_CHECKING,
+     Any,
+     Callable,
++    Collection,
+     List,
+     Optional,
+ )
+@@ -104,11 +105,18 @@ class SchedulerOutputStreamer:
+         self,
+         reqs: List[Req],
+         return_logprob: bool,
+-        skip_req: Optional[Req] = None,
++        skip_reqs: Collection[Req] = (),
+     ):
+-        """Stream the output to detokenizer."""
++        """Stream the output to detokenizer.
++
++        ``skip_reqs`` holds the requests whose prefill did not finish this batch
++        (middle chunks): they appended no new token, so streaming them would
++        emit a duplicate. It is a collection rather than a single request
++        because a batch can carry several mid-prefill requests at once — DLLM
++        already does, and concurrent chunked prefill does in general.
++        """
+         if self.is_generation:
+-            self._stream_output_generation(reqs, return_logprob, skip_req)
++            self._stream_output_generation(reqs, return_logprob, skip_reqs)
+         else:  # embedding or reward model
+             self._stream_output_embedding(reqs)
+ 
+@@ -130,20 +138,23 @@ class SchedulerOutputStreamer:
+         self,
+         reqs: List[Req],
+         return_logprob: bool,
+-        skip_req: Optional[Req] = None,
++        skip_reqs: Collection[Req] = (),
+         is_idle_batch: bool = False,
+     ):
++        # Identity membership, matching the previous `is not skip_req` checks:
++        # Req defines no __eq__/__hash__, so `in` compares by identity.
++        skipped = set(skip_reqs)
+         return_hidden_states = any(
+-            req.return_hidden_states for req in reqs if req is not skip_req
++            req.return_hidden_states for req in reqs if req not in skipped
+         )
+         return_routed_experts = any(
+-            req.return_routed_experts for req in reqs if req is not skip_req
++            req.return_routed_experts for req in reqs if req not in skipped
+         )
+         return_indexer_topk = any(
+-            req.return_indexer_topk for req in reqs if req is not skip_req
++            req.return_indexer_topk for req in reqs if req not in skipped
+         )
+         return_sampling_mask = any(
+-            req.return_sampling_mask for req in reqs if req is not skip_req
++            req.return_sampling_mask for req in reqs if req not in skipped
+         )
+ 
+         acc = _GenerationStreamAccumulator(
+@@ -160,7 +171,7 @@ class SchedulerOutputStreamer:
+             rust_server_mode=self.rust_server is not None,
+         )
+         for req in reqs:
+-            if req is skip_req:
++            if req in skipped:
+                 continue
+             if req.finished() and req.finished_output:
+                 # With the overlap schedule, a request will try to output twice and hit this line twice
+diff --git a/python/sglang/srt/managers/scheduler_pp_mixin.py b/python/sglang/srt/managers/scheduler_pp_mixin.py
+index 42ead03e0e..517a4ba9b9 100644
+--- a/python/sglang/srt/managers/scheduler_pp_mixin.py
++++ b/python/sglang/srt/managers/scheduler_pp_mixin.py
+@@ -48,12 +48,19 @@ if TYPE_CHECKING:
+ 
+ 
+ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
+-    """Check if output send/recv can be skipped for this batch."""
++    """Check if output send/recv can be skipped for this batch.
++
++    `contains_last_prefill_chunk` is the exact condition: it is False only when
++    no request in the batch consumes the sampled token. The former
++    `len(batch.reqs) == 1` term was a proxy for the same thing, back when the
++    flag itself was derived from the batch size; it is now redundant, and
++    keeping it would suppress the optimization for any batch of several middle
++    chunks.
++    """
+     return (
+         envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get()
+         and batch is not None
+         and batch.forward_mode == ForwardMode.EXTEND
+-        and len(batch.reqs) == 1
+         and not batch.contains_last_prefill_chunk
+         and not batch.return_logprob
+     )
+diff --git a/python/sglang/srt/model_executor/model_runner_components/ngram_embedding_manager.py b/python/sglang/srt/model_executor/model_runner_components/ngram_embedding_manager.py
+index 4d034f781b..1373fa3317 100644
+--- a/python/sglang/srt/model_executor/model_runner_components/ngram_embedding_manager.py
++++ b/python/sglang/srt/model_executor/model_runner_components/ngram_embedding_manager.py
+@@ -3,7 +3,7 @@
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+-from typing import TYPE_CHECKING, Optional
++from typing import TYPE_CHECKING, Collection, Optional
+ 
+ import torch
+ 
+@@ -91,7 +91,7 @@ class NgramEmbeddingManager:
+         self,
+         batch: Optional[ScheduleBatch],
+         *,
+-        chunked_req: Optional[Req],
++        chunked_reqs: Collection[Req] = (),
+     ) -> Optional[ScheduleBatch]:
+         """Fill the token table for ngram embedding before a forward pass."""
+         if batch is None or not self.enabled:
+@@ -131,12 +131,13 @@ class NgramEmbeddingManager:
+                 ),
+                 ignore_tokens=None,
+             )
+-            # Mark the chunked (not-yet-finished) prefill request so sample()
+-            # skips writing its pseudo next-token into the ngram token table.
+-            # Use self.chunked_req identity (not req.is_chunked) to avoid
++            # Mark the chunked (not-yet-finished) prefill requests so sample()
++            # skips writing their pseudo next-token into the ngram token table.
++            # Use scheduler-tracked identity (not req.is_chunked) to avoid
+             # overlap-scheduling timing issues.
+-            if chunked_req is not None:
+-                skip_token_table_update = [req is chunked_req for req in batch.reqs]
++            if chunked_reqs:
++                mid_prefill = set(chunked_reqs)
++                skip_token_table_update = [req in mid_prefill for req in batch.reqs]
+                 batch.ne_skip_token_table_update = (
+                     torch.tensor(
+                         skip_token_table_update, dtype=torch.bool, device=device
+diff --git a/python/sglang/srt/observability/metrics_collector.py b/python/sglang/srt/observability/metrics_collector.py
+index adc15d97ad..501a721039 100644
+--- a/python/sglang/srt/observability/metrics_collector.py
++++ b/python/sglang/srt/observability/metrics_collector.py
+@@ -118,6 +118,10 @@ class SchedulerStats:
+     num_retracted_reqs: int = 0
+     num_paused_reqs: int = 0
+ 
++    # Concurrent chunked prefill (unified path)
++    num_chunked_prefill_reqs: int = 0
++    max_concurrent_chunked_reqs: int = 1
++
+     # PD disaggregation
+     num_prefill_bootstrap_queue_reqs: QueueCount = field(default_factory=QueueCount)
+     num_prefill_inflight_queue_reqs: QueueCount = field(default_factory=QueueCount)
+@@ -480,6 +484,41 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
+             labelnames=labels.keys(),
+         )
+ 
++        # =================================================================
++        # Concurrent chunked prefill (unified path)
++        # =================================================================
++        # Unlike the PD-disaggregation gauges below, these are emitted on every
++        # engine mode: the mid-prefill set they describe lives in the unified
++        # scheduler, so a non-disaggregated engine would otherwise have no
++        # visibility into concurrent chunked prefill at all.
++        self.num_chunked_prefill_reqs = Gauge(
++            name="sglang:num_chunked_prefill_reqs",
++            documentation=(
++                "The number of requests currently mid-prefill (chunked prefill "
++                "in flight). Bounded by max_concurrent_chunked_reqs."
++            ),
++            labelnames=labels.keys(),
++            multiprocess_mode="mostrecent",
++        )
++        self.max_concurrent_chunked_reqs = Gauge(
++            name="sglang:max_concurrent_chunked_reqs",
++            documentation=(
++                "The configured cap on concurrent mid-prefill requests "
++                "(chunked_prefill_size // long_prefill_token_threshold). 1 when "
++                "concurrent chunked prefill is disabled."
++            ),
++            labelnames=labels.keys(),
++            multiprocess_mode="mostrecent",
++        )
++        self.chunked_prefill_capacity_skipped_total = Counter(
++            name="sglang:chunked_prefill_capacity_skipped_total",
++            documentation=(
++                "Total number of times a request was refused admission because "
++                "the concurrent mid-prefill capacity was full (AddReqResult.SKIP)."
++            ),
++            labelnames=labels.keys(),
++        )
++
+         # =================================================================
+         # PD disaggregation
+         # =================================================================
+@@ -1148,6 +1187,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
+     def increment_bootstrap_failed_reqs(self) -> None:
+         self.num_bootstrap_failed_reqs.labels(**self.labels).inc(1)
+ 
++    def increment_chunked_prefill_capacity_skipped(self) -> None:
++        self.chunked_prefill_capacity_skipped_total.labels(**self.labels).inc(1)
++
+     def increment_transfer_failed_reqs(self) -> None:
+         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
+ 
+@@ -1354,6 +1396,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
+         self._log_gauge(self.num_retracted_reqs, stats.num_retracted_reqs)
+         self._log_gauge(self.num_paused_reqs, stats.num_paused_reqs)
+ 
++        # Concurrent chunked prefill (unified path)
++        self._log_gauge(self.num_chunked_prefill_reqs, stats.num_chunked_prefill_reqs)
++        self._log_gauge(
++            self.max_concurrent_chunked_reqs, stats.max_concurrent_chunked_reqs
++        )
++
+         # PD disaggregation
+         self._log_gauge_queue_count(
+             self.num_prefill_bootstrap_queue_reqs,
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 5c4f3ff44a..4447336ede 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -803,6 +803,11 @@ class ServerArgs:
+         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
+         NS("schedule"),
+     ] = None
++    long_prefill_token_threshold: A[
++        int,
++        "For chunked prefill, the maximum number of prompt tokens a single request may prefill in one scheduled pass. Requests with a longer remaining prompt are prefilled in chunks of at most this size, so up to chunked_prefill_size // threshold requests can be mid-prefill concurrently instead of one long prompt monopolizing the prefill budget. 0 (default) disables the cap: a single request may consume the whole chunked_prefill_size budget. Mirrors vLLM's --long-prefill-token-threshold.",
++        NS("schedule"),
++    ] = 0
+     enable_dynamic_chunking: A[
+         bool,
+         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
+@@ -3694,6 +3699,7 @@ class ServerArgs:
+         self._handle_kv4_compatibility()
+         self._handle_mxfp8_kv_cache_compatibility()
+         self._handle_page_size()
++        self._handle_long_prefill_token_threshold()
+         self._handle_amd_specifics()
+         self._handle_nccl_pre_warm()
+         self._handle_grammar_backend()
+@@ -6146,6 +6152,20 @@ class ServerArgs:
+ 
+         run_post_process_pass(self, _page_size_default)
+ 
++    def _handle_long_prefill_token_threshold(self):
++        if self.long_prefill_token_threshold < 0:
++            raise ValueError(
++                "--long-prefill-token-threshold must be >= 0, got "
++                f"{self.long_prefill_token_threshold}."
++            )
++        if self.long_prefill_token_threshold > 0 and (
++            self.chunked_prefill_size is None or self.chunked_prefill_size <= 0
++        ):
++            raise ValueError(
++                "--long-prefill-token-threshold requires chunked prefill to be "
++                "enabled (chunked_prefill_size > 0)."
++            )
++
+     def _handle_amd_specifics(self):
+         if is_hip():
+             self.triton_attention_num_kv_splits = 16
+diff --git a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
+index c4e23ec62f..e2fbe4e22f 100644
+--- a/python/sglang/srt/speculative/eagle_utils.py
++++ b/python/sglang/srt/speculative/eagle_utils.py
+@@ -23,6 +23,7 @@ from sglang.srt.utils import (
+     is_hip,
+     is_musa,
+     is_npu,
++    is_pin_memory_available,
+     is_xpu,
+ )
+ from sglang.srt.utils.async_probe import maybe_detect_oob
+@@ -87,16 +88,25 @@ def _eagle_prefill_tail_tokens(
+     """Per-seq tail token for EAGLE prefill rotation; uses next prompt token for
+     non-final chunks (chunked-prefill chain consistency, see PR #26329)."""
+     tail_tokens = next_token_ids.to(batch.input_ids.dtype)
+-    next_prompt_token = batch.chunked_req_next_prompt_token
+-    if next_prompt_token is not None:
+-        for i, r in enumerate(batch.reqs):
+-            if r is batch.chunked_req:
+-                tail_tokens = tail_tokens.clone()
+-                # Keep the scalar as a kernel argument. Assigning a Python scalar
+-                # through scalar indexing issues a pageable H2D copy and
+-                # synchronizes the current CUDA stream before draft extend.
+-                tail_tokens[i : i + 1].fill_(next_prompt_token)
+-                break
++    next_prompt_tokens = batch.chunked_next_prompt_tokens
++    if next_prompt_tokens is not None:
++        rows = [i for i, tok in enumerate(next_prompt_tokens) if tok is not None]
++        if rows:
++            tail_tokens = tail_tokens.clone()
++            # One pinned, non-blocking H2D copy for all substituted rows.
++            # Assigning Python scalars through indexing would issue a pageable
++            # copy per row and synchronize the current CUDA stream before draft
++            # extend.
++            pin = is_pin_memory_available(tail_tokens.device)
++            index = torch.tensor(rows, dtype=torch.int64, pin_memory=pin).to(
++                tail_tokens.device, non_blocking=True
++            )
++            values = torch.tensor(
++                [next_prompt_tokens[i] for i in rows],
++                dtype=tail_tokens.dtype,
++                pin_memory=pin,
++            ).to(tail_tokens.device, non_blocking=True)
++            tail_tokens.index_copy_(0, index, values)
+     return tail_tokens
+ 
+ 
+diff --git a/python/sglang/test/scripted_runtime/context/queries.py b/python/sglang/test/scripted_runtime/context/queries.py
+index 7cfab1f407..24f9d86aac 100644
+--- a/python/sglang/test/scripted_runtime/context/queries.py
++++ b/python/sglang/test/scripted_runtime/context/queries.py
+@@ -9,8 +9,7 @@ if TYPE_CHECKING:
+ 
+ def _get_all_reqs(ctx: ScriptedContext) -> Iterator[Req]:
+     s = ctx.scheduler
+-    if s.chunked_req is not None:
+-        yield s.chunked_req
++    yield from s.chunked_reqs
+     yield from s.waiting_queue
+     if s.ps.pp_size > 1:
+         for mb in (*s.mbs, *s.last_mbs, *s.running_mbs):
+@@ -29,8 +28,8 @@ def list_active_reqs(ctx: ScriptedContext) -> List[Req]:
+ 
+ def batch_composition(ctx: ScriptedContext) -> Dict[str, List[str]]:
+     s = ctx.scheduler
+-    chunked_rid = s.chunked_req.rid if s.chunked_req is not None else None
+-    chunked = [chunked_rid] if chunked_rid is not None else []
++    chunked_rids = {r.rid for r in s.chunked_reqs}
++    chunked = sorted(chunked_rids)
+     running = (
+         [r.rid for r in s.running_batch.reqs] if s.running_batch is not None else []
+     )
+@@ -40,7 +39,7 @@ def batch_composition(ctx: ScriptedContext) -> Dict[str, List[str]]:
+     batch = s.last_batch
+     if batch is not None and not batch.is_empty() and batch.forward_mode is not None:
+         bucket = prefill if batch.forward_mode.is_extend() else decode
+-        bucket.extend(r.rid for r in batch.reqs if r.rid != chunked_rid)
++        bucket.extend(r.rid for r in batch.reqs if r.rid not in chunked_rids)
+ 
+     return {
+         "prefill": prefill,
+@@ -53,7 +52,7 @@ def batch_composition(ctx: ScriptedContext) -> Dict[str, List[str]]:
+ def is_idle(ctx: ScriptedContext) -> bool:
+     s = ctx.scheduler
+     return (
+-        s.chunked_req is None
++        not s.chunked_reqs
+         and len(s.waiting_queue) == 0
+         and (s.running_batch is None or s.running_batch.is_empty())
+     )
+@@ -98,7 +97,7 @@ def is_finished(ctx: ScriptedContext, rid: str) -> bool:
+ 
+ def is_chunking(ctx: ScriptedContext, rid: str) -> bool:
+     s = ctx.scheduler
+-    return s.chunked_req is not None and s.chunked_req.rid == rid
++    return any(r.rid == rid for r in s.chunked_reqs)
+ 
+ 
+ def status(ctx: ScriptedContext, rid: str) -> str:
+@@ -122,11 +121,11 @@ def remaining_prompt_tokens(ctx: ScriptedContext, rid: str) -> int:
+ 
+ def chunks_done(ctx: ScriptedContext, rid: str) -> int:
+     log = ctx._scheduler_hook._batch_log
+-    held = sum(1 for record in log if record.chunked_rid == rid and rid in record.rids)
++    held = sum(1 for record in log if rid in record.chunked_rids and rid in record.rids)
+     if held == 0:
+         return 0
+     completed = any(
+-        rid in record.extend_rids and record.chunked_rid != rid for record in log
++        rid in record.extend_rids and rid not in record.chunked_rids for record in log
+     )
+     return held + (1 if completed else 0)
+ 
+@@ -135,5 +134,5 @@ def chunked_parks(ctx: ScriptedContext, rid: str) -> int:
+     return sum(
+         1
+         for record in ctx._scheduler_hook._batch_log
+-        if record.chunked_rid == rid and rid not in record.rids
++        if rid in record.chunked_rids and rid not in record.rids
+     )
+diff --git a/python/sglang/test/scripted_runtime/scheduler_hook.py b/python/sglang/test/scripted_runtime/scheduler_hook.py
+index 58253cfcb8..b4e5078704 100644
+--- a/python/sglang/test/scripted_runtime/scheduler_hook.py
++++ b/python/sglang/test/scripted_runtime/scheduler_hook.py
+@@ -49,7 +49,7 @@ class ScriptedBatchRecord:
+     mode: Optional[str]
+     rids: Tuple[str, ...]
+     extend_rids: Tuple[str, ...]
+-    chunked_rid: Optional[str]
++    chunked_rids: Tuple[str, ...]
+ 
+ 
+ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
+@@ -185,7 +185,6 @@ class ScriptedSchedulerHook:
+     def on_run_batch(self, batch) -> None:
+         if not self._is_driver:
+             return
+-        chunked = self.scheduler.chunked_req
+         self._batch_log.append(
+             ScriptedBatchRecord(
+                 forward_iter=batch.forward_iter,
+@@ -200,7 +199,7 @@ class ScriptedSchedulerHook:
+                     if batch.forward_mode is not None and batch.forward_mode.is_extend()
+                     else ()
+                 ),
+-                chunked_rid=chunked.rid if chunked is not None else None,
++                chunked_rids=tuple(r.rid for r in self.scheduler.chunked_reqs),
+             )
+         )
+ 
+diff --git a/python/sglang/test/scripted_runtime_chunked_helpers.py b/python/sglang/test/scripted_runtime_chunked_helpers.py
+index 393d064ff6..72e24aef95 100644
+--- a/python/sglang/test/scripted_runtime_chunked_helpers.py
++++ b/python/sglang/test/scripted_runtime_chunked_helpers.py
+@@ -109,7 +109,7 @@ def advance_to_nth_chunk(r, target_chunk: int, *, max_steps: int = DEFAULT_MAX_S
+     # Drive until the hook has recorded `target_chunk` chunked-prefill batches.
+     # chunks_done is accumulated from on_run_batch (every forward batch), so it
+     # never misses a chunk the way sampling the instantaneous is_chunking flag
+-    # once per yield can: on the step the req leaves chunked_req, is_chunking is
++    # once per yield can: on the step the req leaves chunked_reqs, is_chunking is
+     # already False, so `seen` undercounted and the req could race to completion
+     # on slower CI before the loop caught up.
+     for _ in range(max_steps):

@@ -1,0 +1,339 @@
+From: JeongBong Seo <lifeofthanks@gmail.com>
+Date: Sat, 5 Sep 2026 15:40:21 +0900
+Subject: [PATCH] [scheduler] share the prefill budget, and the clock, with decode
+
+Two changes on top of the concurrent-chunked-prefill backport, both aimed at
+the same symptom: one long prompt takes the whole machine.
+
+1. Bind --long-prefill-token-threshold only when contended.
+
+vLLM applies the per-request ceiling on every pass. Splitting a prompt that
+nothing is waiting on buys nothing and pays per-pass overhead four times over
+at threshold = chunked_prefill_size / 4, so gate it on there being another
+consumer: a request queued behind this one, or one already decoding. In a
+busy server that is true almost always -- anything in the running batch trips
+it -- so what changes is the idle case, where a long prompt with the server
+to itself keeps the whole chunked_prefill_size. The cost is that a request
+arriving mid-pass waits out one full-size chunk before the ceiling binds.
+
+2. Add --decode-passes-per-prefill.
+
+get_next_batch_to_run hands the pass to prefill whenever a prefill batch
+exists, so a long prompt wins every pass until it completes and every
+generating session stops for the duration. A 114K prompt at 4096/chunk is 28
+passes -- about 95s of no decode for anyone. The ceiling above does not help:
+it changes how much a request takes per pass, not who gets the pass.
+
+The unit has to be right. A prefill pass runs ~3.4s against ~30ms for a
+decode pass, so alternating one for one leaves decode ~1% of the wall clock;
+useful settings are tens of decode passes per prefill pass, not fractions.
+
+And the decision has to be rank-invariant. Every TP rank runs its own
+scheduler, and they stay in lockstep only because they decide from state they
+all share. An earlier version of this measured wall time per rank and yielded
+when decode was below a target share of it; the accumulators drifted apart
+almost immediately (5.868s vs 5.869s within seconds of starting), and once
+the drift straddled the threshold one rank ran prefill while the other ran
+decode. Their collectives did not match and the job hung inside NCCL, GPUs at
+100%, nothing in the log -- the visible stack was a .tolist() in the GDN
+chunk kernel, the first CPU-GPU sync behind the stalled stream. The prefill
+delayer already negotiates this decision across ranks
+(negotiate_should_allow_prefill), which is the same lesson written down.
+
+So the decision is a counter driven by the branch taken and decided by the
+counter: a state machine whose only inputs are the setting and the running
+batch, both identical on every rank. Wall time is still measured, but only to
+report the split each setting achieved -- the number to tune against, and one
+that must never feed back into the decision.
+
+A yielded pass runs the adder as usual with yield_to_decode set, which parks
+every carried request through the backport's own
+_reserve_completion_for_parked_req path and admits nothing new; can_run_list
+comes back empty and the existing `len(can_run_list) == 0` return hands the
+pass to decode. Returning early instead -- the obvious implementation, and
+the one tried first -- skips init_next_round_input() and the carried-request
+re-admit, leaving each mid-prefill request holding the previous pass's
+extend_range against an unadvanced prefix_indices. The top-of-step guard then
+stays true and stash_chunked_request re-caches the same chunk every pass,
+taking a fresh mamba slot each time, until the invariant checker dumps leaked
+KV tokens and leaked_mamba_pages and the watchdog kills the server. The
+delayer directly above carries that lesson too, in its own guard ("that pass
+must proceed regardless").
+
+Yields only when there is decode work: a pass given up with an empty or
+prefill-only running batch is a pass nobody runs. 0 (default) disables it
+entirely -- the predicate returns before touching any state, so the adder
+behaves exactly as it does without this change.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+---
+diff --git a/python/sglang/srt/managers/schedule_policy.py b/python/sglang/srt/managers/schedule_policy.py
+index 4ceab6905e..988b589a56 100644
+--- a/python/sglang/srt/managers/schedule_policy.py
++++ b/python/sglang/srt/managers/schedule_policy.py
+@@ -524,6 +524,7 @@ class PrefillAdder:
+         waiting_queue_len: int = 0,
+         prefill_tile_block_m: int = 64,
+         long_prefill_token_threshold: int = 0,
++        yield_to_decode: bool = False,
+         max_concurrent_chunked_reqs: int = 1,
+     ):
+         self.page_size = page_size
+@@ -628,6 +629,13 @@ class PrefillAdder:
+         # up to chunked_prefill_size // threshold requests can be mid-prefill
+         # concurrently. 0 disables the cap (one request may drain the pool).
+         self.long_prefill_token_threshold = long_prefill_token_threshold
++        # When set, the ceiling only applies while something else is waiting on
++        # the prefill budget; a request prefilling alone keeps the whole pool.
++        # This pass belongs to decode: park every carried request and admit
++        # nothing new, so can_run_list comes back empty and the caller falls
++        # through to the decode branch. Parking (not skipping) is what keeps
++        # the mid-prefill bookkeeping intact.
++        self.yield_to_decode = yield_to_decode
+         # How many requests may be mid-prefill at once. Mid-prefill requests
+         # pin their computed KV and cannot be retracted, so the bound also
+         # caps the reserved-but-uncomputed KV held for them.
+@@ -1045,7 +1053,33 @@ class PrefillAdder:
+             + self._mamba_gap_budget_for_req(req)
+         )
+ 
++    def _ceiling_applies(self) -> bool:
++        """Whether the per-request prefill ceiling should bind this pass.
++
++        Only when someone else needs the pass: a request queued behind this
++        one, or a request already decoding. vLLM applies the ceiling
++        unconditionally, but splitting a prompt that nothing is waiting on
++        buys nothing and pays per-pass overhead four times over at
++        threshold = chunked_prefill_size / 4.
++
++        In a busy server this is true almost always -- anything in the running
++        batch trips it -- so the behaviour it changes is the idle one: a long
++        prompt with the server to itself keeps the whole
++        ``chunked_prefill_size``. The cost is that a request arriving mid-pass
++        waits out a full-size chunk before the ceiling starts binding.
++        """
++        if self.long_prefill_token_threshold <= 0:
++            return False
++        return self.waiting_queue_len > 0 or len(self.running_batch.reqs) > 0
++
+     def add_chunked_req(self, req: Req):
++        if self.yield_to_decode:
++            # Park, do not skip. A skipped request keeps last pass's
++            # extend_range, so the scheduler re-stashes the same chunk next
++            # pass and leaks its KV and mamba pages.
++            self._reserve_completion_for_parked_req(req)
++            return req
++
+         if self.dllm_config is not None:
+             _rem_tokens = self._get_dllm_remain_tokens()
+         else:
+@@ -1074,7 +1108,7 @@ class PrefillAdder:
+ 
+             # Per-request ceiling, applied to continued chunks as well: one
+             # carried request cannot drain the pool ahead of the others.
+-            if self.long_prefill_token_threshold > 0:
++            if self._ceiling_applies():
+                 _rem_tokens = min(_rem_tokens, self.long_prefill_token_threshold)
+ 
+         # A mid-chunk rank prefills this pass regardless of the delayer
+@@ -1137,6 +1171,9 @@ class PrefillAdder:
+                 self.tree_cache.dec_lock_ref(last_node)
+ 
+     def add_one_req_ignore_eos(self, req: Req, num_chunked_reqs: int):
++        if self.yield_to_decode:
++            return AddReqResult.OTHER
++
+         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
+             req.prefix_indices
+         )
+@@ -1219,7 +1256,7 @@ class PrefillAdder:
+         # in add_one_req: applied before the chunked/non-chunked split, so a
+         # request under the ceiling still admits whole.
+         chunk_tokens_limit = self.rem_chunk_tokens
+-        if self.long_prefill_token_threshold > 0 and chunk_tokens_limit is not None:
++        if self._ceiling_applies() and chunk_tokens_limit is not None:
+             chunk_tokens_limit = min(
+                 chunk_tokens_limit, self.long_prefill_token_threshold
+             )
+@@ -1306,6 +1343,9 @@ class PrefillAdder:
+         num_chunked_reqs: int,
+         truncation_align_size: Optional[int],
+     ):
++        if self.yield_to_decode:
++            return AddReqResult.OTHER
++
+         """Admit one waiting request.
+ 
+         ``num_chunked_reqs`` is how many requests are already mid-prefill,
+@@ -1408,7 +1448,7 @@ class PrefillAdder:
+                         return AddReqResult.NO_TOKEN
+                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
+ 
+-            if self.long_prefill_token_threshold > 0 and chunk_tokens_limit is not None:
++            if self._ceiling_applies() and chunk_tokens_limit is not None:
+                 # vLLM-compatible per-request ceiling: no request prefills
+                 # more than the threshold in one pass, so up to
+                 # chunked_prefill_size // threshold requests can be
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 65adb448c0..adb7968247 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1194,6 +1194,19 @@ class Scheduler(
+         # carried across passes until their prefill completes. Ordered oldest
+         # first, so budget is handed out in admission order.
+         self.chunked_reqs: List[Req] = []
++        # Decaying wall-time spent in prefill vs decode passes, for
++        # --decode-time-share. Both decay with the configured half-life so the
++        # ratio tracks recent behaviour instead of the whole run.
++        self._prefill_time_acc = 0.0
++        self._decode_time_acc = 0.0
++        # EWMA of how long one prefill pass takes, used to pre-pay for the
++        # next one (see _should_yield_pass_to_decode).
++        self._prefill_pass_est = 0.0
++        # Length of the current run of yielded passes, for the diagnostics and
++        # the safety cap in _should_yield_pass_to_decode.
++        self._consecutive_yields = 0
++        self._last_pass_at: Optional[float] = None
++        self._last_pass_was_prefill = False
+         self._pending_chunked_abort_reqs: List[Req] = []
+         # Upper bound on how many requests may be mid-prefill at once. Raised
+         # above 1 only when the per-request prefill cap is enabled (see
+@@ -3220,6 +3233,7 @@ class Scheduler(
+         if new_batch is not None:
+             # Run prefill first if possible
+             ret = new_batch
++            self._note_scheduled_pass(ran_prefill=True)
+         else:
+             # Run decode (skip for prefill-only batches)
+             if not running_batch.is_empty() and not running_batch.is_prefill_only:
+@@ -3227,6 +3241,7 @@ class Scheduler(
+                 ret = running_batch if not running_batch.is_empty() else None
+             else:
+                 ret = None
++            self._note_scheduled_pass(ran_prefill=False)
+ 
+         # Handle DP attention and log stats
+         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+@@ -3277,6 +3292,92 @@ class Scheduler(
+ 
+         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+ 
++    # Half-life of the moving average behind the yield diagnostics. Not a
++    # setting: it smooths a number that is only ever logged.
++    _YIELD_STATS_HALF_LIFE_S = 5.0
++
++    def _should_yield_pass_to_decode(self, running_batch: ScheduleBatch) -> bool:
++        """Whether decode should get this scheduling pass instead of prefill.
++
++        Every TP rank runs its own scheduler and they stay in lockstep only
++        because they decide from state they all share. This decision therefore
++        has to be a pure function of that state -- a counter driven by the
++        branch taken, which is itself decided by the counter. Deriving it from
++        anything rank-local (wall-clock time, most obviously) lets the ranks
++        disagree: one runs prefill while the other runs decode, their
++        collectives do not match, and the job hangs inside NCCL with the GPUs
++        spinning and nothing in the log.
++
++        Yields only when there is decode work: a pass given up with an empty or
++        prefill-only running batch is a pass nobody runs. Both conditions read
++        the running batch, which is identical on every rank.
++        """
++        per_prefill = get_schedule().decode_passes_per_prefill
++        if per_prefill <= 0:
++            return False
++        if running_batch.is_empty() or running_batch.is_prefill_only:
++            # Reset so a prefill that resumes after an idle decode stretch does
++            # not immediately owe a full run of yields.
++            self._consecutive_yields = 0
++            return False
++
++        if self._consecutive_yields >= per_prefill:
++            if self._consecutive_yields:
++                logger.info(
++                    "decode-share: resuming prefill after %d decode passes (%s)",
++                    self._consecutive_yields,
++                    self._yield_state_str(),
++                )
++            self._consecutive_yields = 0
++            return False
++
++        self._consecutive_yields += 1
++        return True
++
++    def _yield_state_str(self) -> str:
++        """Measured split, for tuning --decode-passes-per-prefill.
++
++        Rank-local and therefore only ever logged -- feeding a wall-clock
++        measurement back into the decision is what made the ranks diverge.
++        """
++        total = self._prefill_time_acc + self._decode_time_acc
++        ratio = self._decode_time_acc / total if total > 0 else 0.0
++        return (
++            f"decode_time_share={ratio:.3f} "
++            f"prefill_acc={self._prefill_time_acc:.3f}s "
++            f"decode_acc={self._decode_time_acc:.3f}s "
++            f"prefill_pass_est={self._prefill_pass_est:.3f}s"
++        )
++
++    def _note_scheduled_pass(self, ran_prefill: bool) -> None:
++        """Attribute elapsed wall time to prefill or decode, for the log only.
++
++        Measured between scheduling decisions and charged to whichever ran
++        last. This is the number to tune --decode-passes-per-prefill against;
++        it must never feed the decision itself (see
++        _should_yield_pass_to_decode).
++        """
++        if get_schedule().decode_passes_per_prefill <= 0:
++            return
++
++        now = time.perf_counter()
++        if self._last_pass_at is not None:
++            elapsed = max(now - self._last_pass_at, 0.0)
++            decay = 0.5 ** (elapsed / self._YIELD_STATS_HALF_LIFE_S)
++            self._prefill_time_acc *= decay
++            self._decode_time_acc *= decay
++            if self._last_pass_was_prefill:
++                self._prefill_time_acc += elapsed
++                self._prefill_pass_est = (
++                    elapsed
++                    if self._prefill_pass_est == 0.0
++                    else 0.8 * self._prefill_pass_est + 0.2 * elapsed
++                )
++            else:
++                self._decode_time_acc += elapsed
++        self._last_pass_at = now
++        self._last_pass_was_prefill = ran_prefill
++
+     def _get_new_batch_prefill_raw(
+         self,
+         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
+@@ -3373,6 +3474,12 @@ class Scheduler(
+             prefill_tile_block_m=prefill_tile_block_m,
+             long_prefill_token_threshold=get_schedule().long_prefill_token_threshold,
+             max_concurrent_chunked_reqs=self.max_concurrent_chunked_reqs,
++            # Yielding runs the adder as usual and lets it park everything:
++            # returning early instead would skip the carried-request re-admit
++            # below, leaving each mid-prefill request holding last pass's
++            # extend_range so the next step re-stashes the same chunk and
++            # leaks its KV and mamba pages.
++            yield_to_decode=self._should_yield_pass_to_decode(running_batch),
+         )
+ 
+         # Re-admit the requests carried over from earlier passes, oldest first,
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 31fd083909..d6e21d4849 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -808,6 +808,11 @@ class ServerArgs:
+         "For chunked prefill, the maximum number of prompt tokens a single request may prefill in one scheduled pass. Requests with a longer remaining prompt are prefilled in chunks of at most this size, so up to chunked_prefill_size // threshold requests can be mid-prefill concurrently instead of one long prompt monopolizing the prefill budget. 0 (default) disables the cap: a single request may consume the whole chunked_prefill_size budget. Mirrors vLLM's --long-prefill-token-threshold.",
+         NS("schedule"),
+     ] = 0
++    decode_passes_per_prefill: A[
++        int,
++        "While a prefill is in flight, run this many decode passes between consecutive prefill passes. Prefill otherwise wins every pass and generation stops until the prompt finishes. A decode pass is ~100x shorter than a prefill pass, so useful values are large: ~25 gives decode roughly a quarter of the wall clock at 4096-token chunks. The scheduler logs the ratio it actually achieved -- tune against that. 0 (default) disables.",
++        NS("schedule"),
++    ] = 0
+     enable_dynamic_chunking: A[
+         bool,
+         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
