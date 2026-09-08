@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply the three vendored patches to SGLang inside the container.
+# Apply the four vendored patches to SGLang inside the container.
 #
 # Run from the compose's command, before launch_server. Idempotent: a restart
 # re-runs it and detects the already-applied state instead of failing.
@@ -19,9 +19,10 @@ PATCHES=(
   "0001-concurrent-chunked-prefill.patch"
   "0002-attention-backend-logging.patch"
   "0003-decode-passes-per-prefill.patch"
+  "0004-autoround-w4a8.patch"
 )
 
-# One marker per patch, chosen to survive the later patches: all three touch
+# Markers for 0001..0003, chosen to survive later patches: these touch
 # the same three files, so `git apply --reverse --check` on an earlier patch
 # fails once a later one has rewritten its context. Per-patch reverse checks
 # read that as "not applied" and the script then reapplies into a patched
@@ -35,12 +36,17 @@ marker_0002() {
     "$SGLANG_DIR/python/sglang/srt/layers/attention/attention_registry.py"
 }
 marker_0003() { markers_scheduling_flag decode_passes_per_prefill; }
+# 0004 touches separate files. Check the entire patch, including CUDA sources.
+marker_0004() {
+  git -C "$SGLANG_DIR" apply --reverse --check "$HERE/${PATCHES[3]}" >/dev/null 2>&1
+}
 
 state() {
   local n=0
   marker_0001 && n=$((n + 1))
   marker_0002 && n=$((n + 1))
   marker_0003 && n=$((n + 1))
+  marker_0004 && n=$((n + 1))
   echo "$n"
 }
 
@@ -48,33 +54,38 @@ state() {
   echo "[club-3090] no SGLang source at $SGLANG_DIR" >&2; exit 1; }
 
 if [ "${1:-}" = "--verify" ]; then
-  for m in 1 2 3; do
+  for m in 1 2 3 4; do
     printf '%-45s ' "${PATCHES[$((m - 1))]}"
     "marker_000$m" && echo "applied" || echo "NOT applied"
   done
-  [ "$(state)" = "3" ] || { echo "incomplete"; exit 1; }
-  echo "all three applied"
+  [ "$(state)" = "4" ] || { echo "incomplete"; exit 1; }
+  echo "all four applied"
   exit 0
 fi
 
+start_index=0
 case "$(state)" in
-  3)
+  4)
     echo "[club-3090] patches already applied — nothing to do"
     exit 0
     ;;
   0) ;;
   *)
-    # Some markers present, not all. Reapplying would fail mid-stack and
-    # leave a worse tree than either end state, so refuse.
-    echo "[club-3090] SGLang at $SGLANG_DIR is PARTIALLY patched — refusing." >&2
-    bash "$0" --verify >&2 || true
-    echo "[club-3090] recreate the container to get a clean image tree." >&2
-    exit 1
+    # Upgrade containers with the complete old stack without reapplying it.
+    if marker_0001 && marker_0002 && marker_0003; then
+      start_index=3
+    else
+      # An incomplete scheduling stack cannot be safely reapplied.
+      echo "[club-3090] SGLang at $SGLANG_DIR is PARTIALLY patched — refusing." >&2
+      bash "$0" --verify >&2 || true
+      echo "[club-3090] recreate the container to get a clean image tree." >&2
+      exit 1
+    fi
     ;;
 esac
 
 cd "$SGLANG_DIR"
-for name in "${PATCHES[@]}"; do
+for name in "${PATCHES[@]:$start_index}"; do
   if git apply --check "$HERE/$name" >/dev/null 2>&1; then
     git apply "$HERE/$name"
     echo "[club-3090] $name — applied"
@@ -86,6 +97,6 @@ for name in "${PATCHES[@]}"; do
   fi
 done
 
-[ "$(state)" = "3" ] || {
+[ "$(state)" = "4" ] || {
   echo "[club-3090] patches applied but a marker is missing" >&2; exit 1; }
-echo "[club-3090] patches OK — both scheduling flags declared"
+echo "[club-3090] patches OK — scheduling, logging and AutoRound W4A8 installed"
