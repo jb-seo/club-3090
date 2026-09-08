@@ -1,0 +1,330 @@
+From 1cf2b8c54d81802abc15dcf23a29b9cc687bc01e Mon Sep 17 00:00:00 2001
+From: Jimmy Shong <69131491+Jiminator@users.noreply.github.com>
+Date: Wed, 19 Aug 2026 18:06:41 -0700
+Subject: [PATCH] [Spec] Support quantized target lm_head in the DFlash2
+ selector (#35496)
+
+Co-authored-by: LING ZHI <1747985437lz@gmail.com>
+---
+ python/sglang/srt/models/dflash.py            |  44 ++++-
+ .../srt/speculative/dflash_worker_v2.py       |  19 +-
+ .../unit/spec/test_dflash_logits.py           | 180 ++++++++++++++++++
+ 3 files changed, 232 insertions(+), 11 deletions(-)
+
+diff --git a/python/sglang/srt/models/dflash.py b/python/sglang/srt/models/dflash.py
+index 526476582e..b7de868d77 100644
+--- a/python/sglang/srt/models/dflash.py
++++ b/python/sglang/srt/models/dflash.py
+@@ -23,7 +23,10 @@ from sglang.srt.layers.linear import (
+     QKVParallelLinear,
+     RowParallelLinear,
+ )
+-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
++from sglang.srt.layers.logits_processor import (
++    LogitsProcessorOutput,
++    should_apply_lm_head_quant_method,
++)
+ from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
+ from sglang.srt.layers.rotary_embedding import get_rope
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+@@ -59,6 +62,22 @@ def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tenso
+     return torch.topk(scores, k, dim=-1)
+ 
+ 
++def _project_candidate_logits(
++    hidden: torch.Tensor, lm_head: nn.Module, *, num_org: int, use_quant_head: bool
++) -> torch.Tensor:
++    """Project draft hiddens through the target head, restricted to the org vocab."""
++    if not use_quant_head:
++        weight = lm_head.weight
++        return torch.matmul(hidden.to(weight.dtype), weight[:num_org].T)
++    # A packed weight can't be row-sliced to the org vocab like the dense path,
++    # and flashinfer's radix top-k rejects the crop view (non-contiguous), so
++    # mask the padded tail out of the top-k instead.
++    logits = lm_head.quant_method.apply(lm_head, hidden, None).contiguous()
++    if logits.shape[-1] > num_org:
++        logits[:, num_org:] = float("-inf")
++    return logits
++
++
+ def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
+     """Honor explicit causality while preserving legacy layer defaults."""
+     text_config = config.get_text_config()
+@@ -965,18 +984,31 @@ class DFlash2DraftModel(DFlashDraftModel):
+         # The worker screens the head before capture, but its eager fallback
+         # (_propose_selector_block) attaches whatever the target has.
+         weight = getattr(self.lm_head, "weight", None)
+-        if not is_dense_head_weight(weight):
++        quant_method = getattr(self.lm_head, "quant_method", None)
++        use_quant_head = should_apply_lm_head_quant_method(self.lm_head, quant_method)
++        if not use_quant_head and not is_dense_head_weight(weight):
+             raise RuntimeError(
+-                "DFlash2 selector requires a dense FP16/BF16/FP32 target lm_head."
++                "DFlash2 selector requires a dense FP16/BF16/FP32 target lm_head "
++                "or a supported lm_head.quant_method."
+             )
+-        hidden = hidden.to(weight.dtype)
+         if get_parallel().tp_size == 1:
+             org = int(self.lm_head.org_vocab_size)
+-            vals, ids = _radix_topk(torch.matmul(hidden, weight[:org].T), k)
++            vals, ids = _radix_topk(
++                _project_candidate_logits(
++                    hidden, self.lm_head, num_org=org, use_quant_head=use_quant_head
++                ),
++                k,
++            )
+             return ids.long(), self._transform_unary_logits(vals)
+         shard = self.lm_head.shard_indices
+         vals, ids = _radix_topk(
+-            torch.matmul(hidden, weight[: int(shard.num_org_elements)].T), k
++            _project_candidate_logits(
++                hidden,
++                self.lm_head,
++                num_org=int(shard.num_org_elements),
++                use_quant_head=use_quant_head,
++            ),
++            k,
+         )
+         global_ids = ids.long() + int(shard.org_vocab_start_index)
+         gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index 7fa236f7a1..7ae69921b5 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -20,6 +20,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
+ from sglang.srt.distributed import get_tp_group
+ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+ from sglang.srt.environ import envs
++from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+ from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+ from sglang.srt.managers.schedule_batch import ScheduleBatch
+ from sglang.srt.managers.scheduler import GenerationBatchResult
+@@ -482,14 +483,17 @@ class DFlashWorkerV2(BaseSpecWorker):
+         lm_head = getattr(target_model, "lm_head", None)
+         if lm_head is None:
+             return _eager("no target lm_head")
+-        if not hasattr(lm_head, "weight"):
+-            return _eager("quantized lm_head has no dense weight")
+-        if not is_dense_head_weight(lm_head.weight):
+-            # Quantized lm_head (FP8/INT) would break the static matmul.
+-            return _eager("quantized lm_head")
+ 
+         if self.selector is not None:
+             # compute_candidates needs the target lm_head attached before capture.
++            # A gate-admitted quantized head is capture-safe: the target's own
++            # logits path already runs the same kernel under CUDA graphs.
++            if not is_dense_head_weight(
++                getattr(lm_head, "weight", None)
++            ) and not should_apply_lm_head_quant_method(
++                lm_head, getattr(lm_head, "quant_method", None)
++            ):
++                return _eager("unsupported quantized lm_head")
+             self.draft_model.lm_head = lm_head
+             if self.ps.tp_rank == 0:
+                 logger.info(
+@@ -502,6 +506,11 @@ class DFlashWorkerV2(BaseSpecWorker):
+                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+                 device=self.device,
+             )
++        if not hasattr(lm_head, "weight"):
++            return _eager("quantized lm_head has no dense weight")
++        if not is_dense_head_weight(lm_head.weight):
++            # Quantized lm_head (FP8/INT) would break the static matmul.
++            return _eager("quantized lm_head")
+         tp_group = get_tp_group()
+         if not hasattr(lm_head, "shard_indices"):
+             if tp_group.world_size != 1:
+diff --git a/test/registered/unit/spec/test_dflash_logits.py b/test/registered/unit/spec/test_dflash_logits.py
+index 26de694a4e..244d204328 100644
+--- a/test/registered/unit/spec/test_dflash_logits.py
++++ b/test/registered/unit/spec/test_dflash_logits.py
+@@ -83,6 +83,186 @@ def test_selector_rejects_a_quantized_target_lm_head():
+         DFlash2DraftModel.compute_candidates(model, torch.randn(2, 4))
+ 
+ 
++def _flashinfer_contract_topk(scores, k, sorted=False, deterministic=False):
++    """Stand-in for flashinfer.top_k pinning its call contract: contiguous
++    input (its CHECK_INPUT) and the explicit sorted/deterministic flags
++    _radix_topk relies on (the real kernel defaults both to False)."""
++    assert scores.is_contiguous()
++    assert sorted and deterministic
++    return torch.topk(scores, k, dim=-1)
++
++
++class _FakeQuantMethod:
++    """Projects through a captured dense weight, asserting the packed-head
++    call contract (packed dtype, no bias). The padded tail comes out as
++    dominant garbage so a masking regression surfaces as wrong candidates."""
++
++    def __init__(self, dense_weight, num_padded):
++        self.dense_weight = dense_weight
++        self.num_padded = num_padded
++        self.called = False
++
++    def apply(self, layer, x, bias):
++        self.called = True
++        assert layer.weight.dtype == torch.int8
++        assert bias is None
++        logits = torch.matmul(x, self.dense_weight.T)
++        pad = logits.new_full((logits.shape[0], self.num_padded), 100.0)
++        full = torch.cat([logits, pad], dim=-1)
++        # A strided view, like a kernel writing into a wider workspace: the
++        # projection must materialize it before flashinfer's radix top-k.
++        return torch.stack([full, full], dim=-1)[..., 0]
++
++
++def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
++    monkeypatch,
++):
++    """Packed head weights must be projected through their quantization method,
++    with the padded-vocab tail masked out of the top-k on contiguous logits:
++    flashinfer's radix top-k rejects non-contiguous input, so a plain crop view
++    would fail at capture on any padded vocab."""
++    torch.manual_seed(0)
++    hidden = torch.randn(2, 4)
++    dense_weight = torch.randn(6, 4)
++
++    quant_method = _FakeQuantMethod(dense_weight, num_padded=2)
++    lm_head = SimpleNamespace(
++        # Mimic a 2:1 packed head and two padded vocabulary rows.
++        weight=torch.empty(8, 2, dtype=torch.int8),
++        quant_method=quant_method,
++        org_vocab_size=6,
++    )
++    model = SimpleNamespace(
++        lm_head=lm_head,
++        candidate_selector=SimpleNamespace(top_k=4),
++        _transform_unary_logits=lambda logits: logits.float(),
++    )
++    monkeypatch.setattr(
++        "sglang.srt.models.dflash.get_parallel",
++        lambda: SimpleNamespace(tp_size=1),
++    )
++    monkeypatch.setattr(
++        "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
++    )
++
++    candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(model, hidden)
++
++    expected_logits, expected_ids = torch.topk(
++        torch.matmul(hidden, dense_weight.T), 4, dim=-1
++    )
++    assert quant_method.called
++    torch.testing.assert_close(candidate_ids, expected_ids)
++    torch.testing.assert_close(unary_logits, expected_logits)
++
++
++def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
++    """Pins the TP gather contract on the quantized path: the per-shard
++    org-vocab restriction, the global id offset, and the fp32 cast before the
++    all-gather -- a
++    regression in any of them returns wrong global candidates only under TP,
++    which no single-rank test observes."""
++    torch.manual_seed(0)
++    k = 4
++    # bf16 like production: makes the fp32 upcast before the gather observable.
++    hidden = torch.randn(2, 4, dtype=torch.bfloat16)
++    full_weight = torch.randn(12, 4, dtype=torch.bfloat16)  # org vocab 12, 6+6
++
++    # This process plays rank 1 of tp=2: org rows 6..12 as local rows 0..6,
++    # plus two dominant padded columns that must never reach the candidates.
++    quant_method = _FakeQuantMethod(full_weight[6:], num_padded=2)
++    lm_head = SimpleNamespace(
++        weight=torch.empty(8, 2, dtype=torch.int8),
++        quant_method=quant_method,
++        shard_indices=SimpleNamespace(num_org_elements=6, org_vocab_start_index=6),
++    )
++    model = SimpleNamespace(
++        lm_head=lm_head,
++        candidate_selector=SimpleNamespace(top_k=k),
++        _transform_unary_logits=lambda logits: logits.float(),
++    )
++
++    # Rank 0's gathered contribution, synthesized from the reference weights.
++    rank0_vals, rank0_ids = torch.topk(
++        torch.matmul(hidden, full_weight[:6].T), k, dim=-1
++    )
++
++    def fake_all_gather(x, dim):
++        if x.is_floating_point():
++            assert x.dtype == torch.float32
++            return torch.cat([rank0_vals.float(), x], dim=dim)
++        return torch.cat([rank0_ids.long(), x], dim=dim)
++
++    monkeypatch.setattr(
++        "sglang.srt.models.dflash.get_parallel",
++        lambda: SimpleNamespace(tp_size=2),
++    )
++    monkeypatch.setattr(
++        "sglang.srt.models.dflash.tensor_model_parallel_all_gather", fake_all_gather
++    )
++    monkeypatch.setattr(
++        "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
++    )
++
++    candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(model, hidden)
++
++    expected_logits, expected_ids = torch.topk(
++        torch.matmul(hidden, full_weight.T), k, dim=-1
++    )
++    torch.testing.assert_close(candidate_ids, expected_ids)
++    torch.testing.assert_close(unary_logits, expected_logits.float())
++
++
++def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
++    """The pre-capture screen decides whether a quantized head reaches the
++    graph-folded selector sampler or silently degrades to the eager per-round
++    fallback -- a revert there keeps every compute_candidates test green, so
++    the admission (and the rejection of an unsupported packed head) needs its
++    own guard."""
++    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
++
++    built = {}
++    monkeypatch.setattr(
++        worker_mod,
++        "_SelectorDraftSampler",
++        lambda **kwargs: built.setdefault("sampler", object()),
++    )
++    monkeypatch.setattr(
++        worker_mod,
++        "get_exec",
++        lambda: SimpleNamespace(
++            graph=SimpleNamespace(
++                cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(bs=[1]))
++            )
++        ),
++    )
++    quant_head = SimpleNamespace(
++        weight=torch.empty(8, 2, dtype=torch.int8),
++        quant_method=_FakeQuantMethod(torch.randn(6, 4), num_padded=2),
++    )
++    worker = SimpleNamespace(
++        block_size=8,
++        selector=object(),
++        ps=SimpleNamespace(tp_rank=0),
++        draft_model=SimpleNamespace(lm_head=None),
++        device="cpu",
++        _target_worker=SimpleNamespace(
++            model_runner=SimpleNamespace(model=SimpleNamespace(lm_head=quant_head))
++        ),
++    )
++
++    sampler = worker_mod.DFlashWorkerV2._maybe_build_draft_sampler(worker)
++    assert sampler is built["sampler"]
++    assert worker.draft_model.lm_head is quant_head
++
++    # A packed head without an applicable quant method must stay eager.
++    worker._target_worker.model_runner.model.lm_head = SimpleNamespace(
++        weight=torch.empty(8, 2, dtype=torch.int8)
++    )
++    worker.draft_model.lm_head = None
++    assert worker_mod.DFlashWorkerV2._maybe_build_draft_sampler(worker) is None
++    assert worker.draft_model.lm_head is None
++
++
+ def test_grouped_conv_supports_runtime_block_sizes():
+     """The conv indexes a position inside the block, so it must follow whatever
+     block size the worker resolved -- including one that is not a power of two."""
+-- 
+2.34.1
+

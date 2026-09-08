@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply the four vendored patches to SGLang inside the container.
+# Apply the six vendored patches to SGLang inside the container.
 #
 # Run from the compose's command, before launch_server. Idempotent: a restart
 # re-runs it and detects the already-applied state instead of failing.
@@ -20,6 +20,8 @@ PATCHES=(
   "0002-attention-backend-logging.patch"
   "0003-decode-passes-per-prefill.patch"
   "0004-autoround-w4a8.patch"
+  "0005-add-dflash2-runtime-support.patch"
+  "0006-support-quantized-target-lm-head-for-dflash2.patch"
 )
 
 # Markers for 0001..0003, chosen to survive later patches: these touch
@@ -41,31 +43,75 @@ marker_0004() {
   git -C "$SGLANG_DIR" apply --reverse --check "$HERE/${PATCHES[3]}" >/dev/null 2>&1
 }
 
+# 0006 rewrites 0005's context. Reverse the suffix in a private copy, then
+# check all of 0005 (including added files), never just a class-name marker.
+snapshot_files() {
+  local dest="$1" path
+  shift
+  while IFS= read -r path; do
+    if [ -f "$SGLANG_DIR/$path" ]; then
+      mkdir -p "$dest/$(dirname "$path")"
+      cp "$SGLANG_DIR/$path" "$dest/$path"
+    fi
+  done < <(git apply --numstat "$@" | cut -f3 | sort -u)
+}
+
+detect_dflash_state() (
+  local scratch
+  scratch="$(mktemp -d)"
+  trap 'rm -rf "$scratch"' EXIT
+  snapshot_files "$scratch" "$HERE/${PATCHES[4]}" "$HERE/${PATCHES[5]}"
+  cd "$scratch"
+  if git apply --reverse --check "$HERE/${PATCHES[5]}" >/dev/null 2>&1; then
+    git apply --reverse "$HERE/${PATCHES[5]}"
+    git apply --reverse --check "$HERE/${PATCHES[4]}" >/dev/null 2>&1 || exit 1
+    echo 2
+  elif git apply --reverse --check "$HERE/${PATCHES[4]}" >/dev/null 2>&1; then
+    echo 1
+  else
+    # A clean missing suffix must also be applicable in full. This rejects
+    # modified/partial DFlash patches before touching the real source tree.
+    git apply "$HERE/${PATCHES[4]}" >/dev/null 2>&1 || exit 1
+    git apply --check "$HERE/${PATCHES[5]}" >/dev/null 2>&1 || exit 1
+    echo 0
+  fi
+)
+marker_0005() { [ "$dflash_state" -ge 1 ]; }
+marker_0006() { [ "$dflash_state" -eq 2 ]; }
+
 state() {
   local n=0
   marker_0001 && n=$((n + 1))
   marker_0002 && n=$((n + 1))
   marker_0003 && n=$((n + 1))
   marker_0004 && n=$((n + 1))
+  marker_0005 && n=$((n + 1))
+  marker_0006 && n=$((n + 1))
   echo "$n"
 }
 
 [ -d "$SGLANG_DIR/python/sglang" ] || {
   echo "[club-3090] no SGLang source at $SGLANG_DIR" >&2; exit 1; }
 
+if ! dflash_state="$(detect_dflash_state)"; then
+  echo "[club-3090] DFlash suffix is partial, modified, or DOES NOT APPLY; expected v0.5.18." >&2
+  echo "[club-3090] recreate the container to get a clean image tree." >&2
+  exit 1
+fi
+
 if [ "${1:-}" = "--verify" ]; then
-  for m in 1 2 3 4; do
+  for m in 1 2 3 4 5 6; do
     printf '%-45s ' "${PATCHES[$((m - 1))]}"
     "marker_000$m" && echo "applied" || echo "NOT applied"
   done
-  [ "$(state)" = "4" ] || { echo "incomplete"; exit 1; }
-  echo "all four applied"
+  [ "$(state)" = "6" ] || { echo "incomplete"; exit 1; }
+  echo "all six applied"
   exit 0
 fi
 
 start_index=0
 case "$(state)" in
-  4)
+  6)
     echo "[club-3090] patches already applied — nothing to do"
     exit 0
     ;;
@@ -74,6 +120,12 @@ case "$(state)" in
     # Upgrade containers with the complete old stack without reapplying it.
     if marker_0001 && marker_0002 && marker_0003; then
       start_index=3
+      if marker_0004; then
+        start_index=$((4 + dflash_state))
+      elif [ "$dflash_state" -ne 0 ]; then
+        echo "[club-3090] DFlash installed without intact 0004 — refusing." >&2
+        exit 1
+      fi
     else
       # An incomplete scheduling stack cannot be safely reapplied.
       echo "[club-3090] SGLang at $SGLANG_DIR is PARTIALLY patched — refusing." >&2
@@ -83,6 +135,20 @@ case "$(state)" in
     fi
     ;;
 esac
+
+# Preflight every remaining patch in order before mutating any installed file.
+# In particular, a bad 0006 must not leave an old working stack at 0005.
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+pending=()
+for name in "${PATCHES[@]:$start_index}"; do pending+=("$HERE/$name"); done
+snapshot_files "$scratch" "${pending[@]}"
+for patch in "${pending[@]}"; do
+  if ! git -C "$scratch" apply "$patch"; then
+    echo "[club-3090] $(basename "$patch") — DOES NOT APPLY; installed files unchanged." >&2
+    exit 1
+  fi
+done
 
 cd "$SGLANG_DIR"
 for name in "${PATCHES[@]:$start_index}"; do
@@ -97,6 +163,7 @@ for name in "${PATCHES[@]:$start_index}"; do
   fi
 done
 
-[ "$(state)" = "4" ] || {
+dflash_state="$(detect_dflash_state)"
+[ "$(state)" = "6" ] || {
   echo "[club-3090] patches applied but a marker is missing" >&2; exit 1; }
-echo "[club-3090] patches OK — scheduling, logging and AutoRound W4A8 installed"
+echo "[club-3090] patches OK — scheduling, logging, AutoRound W4A8 and DFlash2 installed"
