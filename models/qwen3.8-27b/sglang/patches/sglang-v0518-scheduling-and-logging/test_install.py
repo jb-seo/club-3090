@@ -11,7 +11,7 @@ import unittest
 
 HERE = Path(__file__).resolve().parent
 SOURCE = Path(sys.argv.pop(1)).resolve()
-PATCHES = sorted(HERE.glob("000[1-9]-*.patch"))
+PATCHES = sorted(HERE.glob("[0-9][0-9][0-9][0-9]-*.patch"))
 
 
 def run(*args, **kwargs):
@@ -109,6 +109,32 @@ class InstallTests(unittest.TestCase):
     def test_partial_mamba_rejected(self):
         self.apply_prefix(7)
         (self.tree / "test/registered/unit/mem_cache/test_mamba_alloc_req_slots_demand.py").unlink()
+        self.assert_rejected_unchanged()
+
+    def test_nine_patch_upgrade_only_changes_demand_files(self):
+        self.apply_prefix(9)
+        before = self.hashes()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        after = self.hashes()
+        self.assertEqual(
+            {path for path in before if before[path] != after[path]},
+            {"python/sglang/srt/mem_cache/allocation.py",
+             "test/registered/unit/mem_cache/test_mamba_alloc_req_slots_demand.py"},
+        )
+        self.assertIn("0010-fix-mamba-demand-v0518-request-fields.patch", result.stdout)
+        verified = self.install("--verify")
+        self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
+        self.assertIn("all ten applied", verified.stdout)
+        self.assertEqual(self.install().returncode, 0)
+        self.assertEqual(after, self.hashes())
+
+    def test_modified_demand_hotfix_rejected(self):
+        self.apply_prefix(10)
+        path = self.tree / "python/sglang/srt/mem_cache/allocation.py"
+        path.write_text(path.read_text(encoding="utf-8").replace(
+            "if req.mamba_pool_idx is None:", "if req.mamba_pool_idx is not None:"),
+            encoding="utf-8")
         self.assert_rejected_unchanged()
 
     def test_modified_mamba_thinning_rejected(self):

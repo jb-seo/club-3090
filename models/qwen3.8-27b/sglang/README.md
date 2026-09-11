@@ -4,7 +4,7 @@ One compose: [`compose/dual/autoround-int4/mtp.yml`](compose/dual/autoround-int4
 Boots, serves, and is fast enough to use. It is **not** a production path yet,
 for reasons that are open questions rather than known defects — see below.
 
-Needs nine vendored patches, applied in-container at startup:
+Needs ten vendored patches, applied in-container at startup:
 [`patches/sglang-v0518-scheduling-and-logging/`](patches/sglang-v0518-scheduling-and-logging/README.md).
 The image is pinned to `lmsysorg/sglang:v0.5.18` because that is what they
 are cut against — `:latest` is already `v0.5.19`.
@@ -13,7 +13,7 @@ are cut against — `:latest` is already `v0.5.19`.
 
 Use `lmsysorg/sglang:v0.5.18` with a Bash entrypoint. The launcher clones
 this fork's `qwen3.8-27b-sglang-mtp` branch into `/workspace/club-3090`, applies
-the nine patches to the image's `/sgl-workspace/sglang` source and runs
+the ten patches to the image's `/sgl-workspace/sglang` source and runs
 `python3 -m sglang.launch_server` in the foreground. It reads the arguments
 and environment from `compose/dual/autoround-int4/mtp.yml` so list-valued
 flags and future compose edits stay in sync.

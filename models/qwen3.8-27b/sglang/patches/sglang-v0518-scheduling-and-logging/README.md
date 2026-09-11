@@ -1,6 +1,6 @@
 # `sglang-v0518-scheduling-and-logging`
 
-Nine patches applied to SGLang **inside the container** at startup by
+Ten patches applied to SGLang **inside the container** at startup by
 `install.sh`, which the compose runs before `launch_server`. Nothing to
 install on the host.
 
@@ -8,9 +8,9 @@ Base is **v0.5.18** (`71de97b264`). The compose pins `lmsysorg/sglang:v0.5.18`
 for that reason: `:latest` is already past it — as of 2026-09-04 `:latest` and
 `:v0.5.19` share a digest (`sha256:d6e72886...3eda9`).
 
-`bash install.sh --verify` reports which of the nine are present, changing
+`bash install.sh --verify` reports which of the ten are present, changing
 nothing. Rerunning `install.sh` upgrades a container with a complete prefix
-of three through eight patches by applying only the remaining patches.
+of three through nine patches by applying only the remaining patches.
 
 ## Why patches, not a fork checkout
 
@@ -38,6 +38,7 @@ tag when moving the pin — do not force them.
 | `0007-mamba-alloc-req-slots-demand.patch` | Counts only the active and ping-pong Mamba slots the batch still needs, then evicts only the shortfall. |
 | `0008-mamba-coverage-thinning.patch` | Selects cold-path checkpoint victims by coverage while preserving v0.5.18's eviction loop. |
 | `0009-mamba-protect-reused-states.patch` | Marks reused Mamba states and excludes them from deeper thinning victims. |
+| `0010-fix-mamba-demand-v0518-request-fields.patch` | Corrects `0007` to use v0.5.18's request-level Mamba fields; fixes the first-prefill `req.kv is None` crash. Includes regression tests using real `Req` objects. |
 
 `0001`–`0004` are scoped to `python/sglang/`. `0005`/`0006` retain their
 upstream tests and original format-patch author/commit metadata. Their bytes
@@ -139,6 +140,36 @@ checkout could not collect because its PyTorch lacks
 `torch.cuda.memory._cuda_beginAllocateCurrentThreadToPool`; GPU serving and
 throughput have not been validated for these backports.
 
+### v0.5.18 compatibility correction (`0010`, 2026-09-11)
+
+The initial `0007` backport applied cleanly but referenced a newer request
+layout: `req.kv.holds_mamba` and `req.kv.mamba_ping_pong_track_buffer`.
+In v0.5.18, `req.kv` starts as `None`, and even initialized `ReqKvInfo` has
+neither Mamba field. The actual allocator uses `req.mamba_pool_idx` and
+`req.mamba_ping_pong_track_buffer`. `0010` matches that allocator and retains
+the reduced eviction demand for COW matches and continuing chunks.
+The reported `NoneType ... holds_mamba` exception is independent of GPU type.
+
+The original upstream test doubles also assumed the newer layout and cache
+API. The correction constructs real release `Req` objects and uses
+`cache.evict`, covering fresh requests, initialized KV info, COW, chunked
+continuations, lazy/non-overlap/no-extra-buffer modes and mixed batches.
+The six allocation tests reproduce the failure before the fix and pass
+after it in a local SGLang v0.5.18 container using CPU tensors. The nine
+Mamba thinning tests and 13 installer tests also pass. GPU serving remains
+unvalidated.
+
+`0001`–`0009` stay byte-identical. After updating the recipe checkout, rerun
+`install.sh` or the RunPod launcher: a container with all nine old patches
+receives only `0010`; recreating the container is not required. Restart the
+SGLang process to load the corrected code. The RunPod launcher reuses its
+checkout without pulling, so update it explicitly before rerunning:
+
+```bash
+git -C /workspace/club-3090 pull --ff-only
+bash /workspace/club-3090/models/qwen3.8-27b/sglang/scripts/run_in_runpot.sh
+```
+
 ## DFlash2 backports (`0005` / `0006`)
 
 Upstream sources, commit SHAs and drop conditions are tracked in
@@ -214,7 +245,7 @@ bash /patches/install.sh --verify
 ### Serving-rig validation: preserve EAGLE, then test DFLASH
 
 The shipped `mtp.yml` stays on its existing EAGLE configuration. Its existing
-mount and `bash /patches/install.sh` command automatically install all nine
+mount and `bash /patches/install.sh` command automatically install all ten
 patches in order at startup; no Docker build or image change is required.
 Copy this entire patch directory to the serving checkout, then recreate the
 existing service using the same environment/model/cache paths.

@@ -2,6 +2,20 @@
 
 Dated history for Qwen3.8-27B configs in this repo. Append-only — add a new entry, don't rewrite past ones.
 
+## 2026-09-11 — Fix the SGLang Mamba backport's request-layout mismatch
+
+The initial allocation-demand backport in `0007` used newer `req.kv` fields
+that do not exist in v0.5.18. A fresh prefill crashed with
+`AttributeError: 'NoneType' object has no attribute 'holds_mamba'`.
+Append `0010` to use the same request-level fields as the release allocator;
+existing nine-patch containers upgrade in place. This corrects the local
+backport of the source tracked in
+[`docs/UPSTREAM.md`](../../docs/UPSTREAM.md#sglang-sgl-projectsglang).
+
+Six allocation tests with real release `Req` objects reproduce the failure
+before the fix and pass afterward; nine thinning tests and 13 installer
+tests also pass. GPU serving/performance have not been validated.
+
 ## 2026-09-11 — SGLang launcher for an existing RunPod container
 
 Add `sglang/scripts/run_in_runpot.sh` for piped startup inside the stock

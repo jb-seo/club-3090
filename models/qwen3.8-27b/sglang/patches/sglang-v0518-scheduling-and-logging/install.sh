@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply the nine vendored patches to SGLang inside the container.
+# Apply the ten vendored patches to SGLang inside the container.
 #
 # Run from the compose's command, before launch_server. Idempotent: a restart
 # re-runs it and detects the already-applied state instead of failing.
@@ -25,6 +25,7 @@ PATCHES=(
   "0007-mamba-alloc-req-slots-demand.patch"
   "0008-mamba-coverage-thinning.patch"
   "0009-mamba-protect-reused-states.patch"
+  "0010-fix-mamba-demand-v0518-request-fields.patch"
 )
 
 # Markers for 0001..0003, chosen to survive later patches: these touch
@@ -91,7 +92,8 @@ marker_0005() { [ "$suffix_state" -ge 1 ]; }
 marker_0006() { [ "$suffix_state" -ge 2 ]; }
 marker_0007() { [ "$suffix_state" -ge 3 ]; }
 marker_0008() { [ "$suffix_state" -ge 4 ]; }
-marker_0009() { [ "$suffix_state" -eq 5 ]; }
+marker_0009() { [ "$suffix_state" -ge 5 ]; }
+marker_0010() { [ "$suffix_state" -eq 6 ]; }
 
 state() {
   local n=0
@@ -104,6 +106,7 @@ state() {
   marker_0007 && n=$((n + 1))
   marker_0008 && n=$((n + 1))
   marker_0009 && n=$((n + 1))
+  marker_0010 && n=$((n + 1))
   echo "$n"
 }
 
@@ -117,18 +120,18 @@ if ! suffix_state="$(detect_suffix_state)"; then
 fi
 
 if [ "${1:-}" = "--verify" ]; then
-  for m in 1 2 3 4 5 6 7 8 9; do
+  for m in 1 2 3 4 5 6 7 8 9 10; do
     printf '%-45s ' "${PATCHES[$((m - 1))]}"
-    "marker_000$m" && echo "applied" || echo "NOT applied"
+    "$(printf 'marker_%04d' "$m")" && echo "applied" || echo "NOT applied"
   done
-  [ "$(state)" = "9" ] || { echo "incomplete"; exit 1; }
-  echo "all nine applied"
+  [ "$(state)" = "10" ] || { echo "incomplete"; exit 1; }
+  echo "all ten applied"
   exit 0
 fi
 
 start_index=0
 case "$(state)" in
-  9)
+  10)
     echo "[club-3090] patches already applied — nothing to do"
     exit 0
     ;;
@@ -181,6 +184,6 @@ for name in "${PATCHES[@]:$start_index}"; do
 done
 
 suffix_state="$(detect_suffix_state)"
-[ "$(state)" = "9" ] || {
+[ "$(state)" = "10" ] || {
   echo "[club-3090] patches applied but a marker is missing" >&2; exit 1; }
 echo "[club-3090] patches OK — scheduling, logging, AutoRound W4A8, DFlash2 and Mamba cache fixes installed"
