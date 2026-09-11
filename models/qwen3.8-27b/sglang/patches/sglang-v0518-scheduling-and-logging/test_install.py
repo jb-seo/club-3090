@@ -120,16 +120,20 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(
             {path for path in before if before[path] != after[path]},
             {"python/sglang/srt/mem_cache/allocation.py",
+             "python/sglang/srt/server_args.py",
              "test/registered/unit/mem_cache/test_mamba_alloc_req_slots_demand.py",
              "python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py",
+             "test/registered/unit/mem_cache/test_mamba_path_state_cap.py",
              "test/registered/unit/mem_cache/test_mamba_eviction_thinning.py"},
         )
         self.assertEqual(set(after) - set(before), {
-            "test/registered/unit/mem_cache/test_mamba_eviction_fairness.py"})
+            "test/registered/unit/mem_cache/test_mamba_eviction_fairness.py",
+            "test/registered/unit/mem_cache/test_mamba_path_cap_coverage.py",
+            "test/manual/mem_cache/benchmark_mamba_path_cap.py"})
         self.assertIn("0010-fix-mamba-demand-v0518-request-fields.patch", result.stdout)
         verified = self.install("--verify")
         self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
-        self.assertIn("all eleven applied", verified.stdout)
+        self.assertIn("all twelve applied", verified.stdout)
         self.assertEqual(self.install().returncode, 0)
         self.assertEqual(after, self.hashes())
 
@@ -143,11 +147,45 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(
             {path for path in before if before[path] != after[path]},
             {"python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py",
+             "python/sglang/srt/server_args.py",
+             "test/registered/unit/mem_cache/test_mamba_path_state_cap.py",
              "test/registered/unit/mem_cache/test_mamba_eviction_thinning.py"},
         )
         self.assertEqual(self.install("--verify").returncode, 0)
         self.assertEqual(self.install().returncode, 0)
         self.assertEqual(after, self.hashes())
+
+    def test_eleven_patch_upgrade_only_changes_path_cap(self):
+        self.apply_prefix(11)
+        before = self.hashes()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("0012-mamba-path-cap-minimax-coverage.patch", result.stdout)
+        after = self.hashes()
+        self.assertEqual(
+            {path for path in before if before[path] != after[path]},
+            {"python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py",
+             "python/sglang/srt/server_args.py",
+             "test/registered/unit/mem_cache/test_mamba_path_state_cap.py"},
+        )
+        self.assertEqual(set(after) - set(before), {
+            "test/registered/unit/mem_cache/test_mamba_path_cap_coverage.py",
+            "test/manual/mem_cache/benchmark_mamba_path_cap.py"})
+        self.assertEqual(self.install("--verify").returncode, 0)
+        self.assertEqual(self.install().returncode, 0)
+        self.assertEqual(after, self.hashes())
+
+    def test_partial_coverage_patch_rejected(self):
+        self.apply_prefix(12)
+        (self.tree / "test/registered/unit/mem_cache/test_mamba_path_cap_coverage.py").unlink()
+        self.assert_rejected_unchanged()
+
+    def test_modified_coverage_score_rejected(self):
+        self.apply_prefix(12)
+        path = self.tree / "python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py"
+        path.write_text(path.read_text(encoding="utf-8").replace(
+            "max_gap = max(max_gap, depth - previous)", "max_gap = 0"), encoding="utf-8")
+        self.assert_rejected_unchanged()
 
     def test_modified_demand_hotfix_rejected(self):
         self.apply_prefix(10)

@@ -2,6 +2,35 @@
 
 Dated history for Qwen3.8-27B configs in this repo. Append-only — add a new entry, don't rewrite past ones.
 
+## 2026-09-11 — Bound Mamba checkpoints by replay coverage
+
+Append `0012` after the existing eleven patches. The per-path insertion cap
+now selects old victims by whole-path maximum replay gap, then integer
+quantile deviation and deterministic depth/ID ties. The newest frontier and
+fork/lock/session/reuse/load-back/leaf protections survive; overflow remains
+soft. The existing post-BackupKV action, Full KV and host copies, exact-demand
+allocation and global fairness/thinning behavior are preserved. This release
+has no Rust radix-tree backend. Pre-admission slot reuse is deferred, so a
+new frontier may briefly require N+1 persistent slots.
+
+The runtime suite passes 55 tests; five GPU backup tests skip because CUDA
+cannot initialize in the local container. All 17 installer tests pass. A
+24-turn CPU policy A/B at cap=3 reduces zero-hit probes from 65.8% to 17.0%
+(4 sessions), 47.8% to 22.5% (8), and 33.0% to 20.8% (12), with the same
+slot ceilings. High pressure still permits poor gaps and full-path loss;
+these are synthetic cache-policy results, not GPU accuracy or TTFT claims.
+Details and reproduction are in the patch README's validation report.
+
+## 2026-09-11 — Do not backport superseded SGLang PR #32606
+
+PR #32606 was evaluated for the v0.5.18 patch series and rejected after its
+single commit conflicted at the exact guard changed by merged successors
+#34043 and #34184. Both successors are already ancestors of v0.5.18: Mamba
+tracking remains wired under speculative decoding and stale padded tracking
+rows are cleared. Applying #32606 would undo the former and force affected
+prefills eager. No runtime patch or installer entry was added; the upstream
+tracker records the sources and removal decision.
+
 ## 2026-09-11 — Share SGLang Mamba eviction pressure across paths
 
 Append local patch `0011`: each eviction sweep takes at most one checkpoint

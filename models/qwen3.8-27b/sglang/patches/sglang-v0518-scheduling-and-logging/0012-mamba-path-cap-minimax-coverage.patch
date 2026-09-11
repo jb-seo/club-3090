@@ -1,0 +1,784 @@
+From: JeongBong Seo <lifeofthanks@gmail.com>
+Subject: [PATCH] Bound per-path Mamba checkpoints by minimax replay coverage
+
+Apply after 0011 on SGLang v0.5.18. Keep the newest frontier and minimize
+the resulting whole-path maximum replay gap when selecting an old victim.
+Break ties by integer uniform-quantile deviation, then prefer older history.
+Protect forks, locks, session references, reused states, load-back pins and
+device leaves. Keep the existing post-BackupKV action ordering and soft cap.
+
+Global pressure eviction, inter-path fairness, exact-demand allocation and
+Full KV eviction are unchanged. This release has no Rust radix-tree backend.
+Includes focused tests and a synthetic CPU policy A/B, not GPU serving claims.
+
+diff --git a/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py b/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py
+index 9968568..f9117d6 100644
+--- a/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py
++++ b/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import logging
+ from collections import defaultdict
+ from typing import TYPE_CHECKING, Callable, Optional, Sequence
+ 
+@@ -63,6 +64,31 @@ MAMBA_REUSED_KEY = "mamba_reused"
+ MAX_THIN_PER_PATH_PER_ROUND = 1
+ MIN_RETAINED_MAMBA_STATES_PER_PATH = 2
+ 
++logger = logging.getLogger(__name__)
++
++
++def _path_cap_coverage_score(
++    depths: Sequence[int], path_start_depth: int = 0
++) -> tuple[int, int]:
++    """Minimax replay gap, then uniform-quantile deviation, for sorted depths.
++
++    Multiply deviation by the survivor count to use integer arithmetic only.
++    All candidates in one decision have the same count and mandatory frontier,
++    so this preserves the ordering of the exact fractional deviations.
++    Protected retained holders naturally bound the gaps on either side.
++    """
++    count = len(depths)
++    if not count:
++        return 0, 0
++    span = depths[-1] - path_start_depth
++    previous = path_start_depth
++    max_gap = deviation = 0
++    for rank, depth in enumerate(depths, 1):
++        max_gap = max(max_gap, depth - previous)
++        deviation += abs(count * (depth - path_start_depth) - rank * span)
++        previous = depth
++    return max_gap, deviation
++
+ 
+ class MambaComponent(TreeComponent):
+     component_type = ComponentType.MAMBA
+@@ -268,7 +294,12 @@ class MambaComponent(TreeComponent):
+         tail: UnifiedTreeNode,
+         cache_actions: list[CacheAction | ComponentAction],
+     ) -> None:
+-        """Defer the path-cap eviction so it runs after the insert's BackupKV."""
++        """Bound each insertion after BackupKV has established its locks.
++
++        Admission/reuse before committing the frontier belongs ahead of this
++        action, but must also preserve backup ordering and slot ownership. For
++        now, allow one transient new state and select an old victim here.
++        """
+         if self.mamba_max_states_per_path < 0:
+             return
+         cache_actions.append(MambaEvictExcessPathStates(tail.id))
+@@ -279,37 +310,36 @@ class MambaComponent(TreeComponent):
+         device_frees: dict[ComponentType, list[torch.Tensor]],
+         host_frees: dict[ComponentType, list[torch.Tensor]],
+     ) -> None:
+-        """Evict shallow eligible device checkpoints beyond the path cap.
++        """Bound retained device checkpoints by whole-path minimax coverage.
+ 
+-        Full KV and any existing host backup are retained. The tail, forks,
+-        locked nodes (including a pending backup chain's write-through locks),
+-        and device leaves are preserved, so the cap is a best-effort soft
+-        limit. Freed slots are collected into the caller's dicts.
++        Score actual radix depths from root to the inserted frontier. Mandatory
++        holders split the replay gaps without changing the root-to-tail cap.
++        Full KV, host backups and protected checkpoints survive; overflow is
++        allowed when no replaceable holder remains. Recompute after each victim
++        when an existing path is far above the cap (e.g. after unlocking).
+         """
+         cap = self.mamba_max_states_per_path
+         if cap < 0:
+             return
+ 
+         ct = self.component_type
+-        holders = []
++        path = []
+         node = tail
+         while node is not None and node is not self.tree_core.root_node:
+-            if node.component_data[ct].value is not None:
+-                holders.append(node)
++            path.append(node)
+             node = node.parent
+-
+-        excess = len(holders) - cap
+-        if excess <= 0:
+-            return
++        holders = []
++        depth = 0
++        for node in reversed(path):
++            depth += len(node.key)
++            if node.component_data[ct].value is not None:
++                holders.append((depth, node))
+ 
+         tracker = {component: 0 for component in self.cache.tree_components}
+-        for node in reversed(holders):
+-            if excess <= 0 or node is tail:
++        while len(holders) > cap:
++            node = self._choose_path_cap_victim(holders, tail)
++            if node is None:
+                 break
+-            if node.component_data[ct].lock_ref > 0 or len(node.children) != 1:
+-                continue
+-            if node in self.tree_core.evictable_device_leaves:
+-                continue
+             self.tree_core._evict_component_and_detach_lru(
+                 node,
+                 self,
+@@ -319,7 +349,64 @@ class MambaComponent(TreeComponent):
+                 tracker=tracker,
+             )
+             self.tree_core._cascade_evict(node, self, tracker, device_frees, host_frees)
+-            excess -= 1
++            holders = [
++                (depth, holder)
++                for depth, holder in holders
++                if holder.component_data[ct].value is not None
++            ]
++
++    def _choose_path_cap_victim(
++        self, holders: Sequence[tuple[int, UnifiedTreeNode]], tail: UnifiedTreeNode
++    ) -> Optional[UnifiedTreeNode]:
++        """Choose among existing states; the inserted frontier is mandatory.
++
++        Keep this separate from #38000's cold-path neighbour-gap selector:
++        here every candidate is scored against ALL surviving checkpoints.
++        Equal minimax/deviation scores evict the deeper state, retaining older
++        historical coverage, then use node ID for a deterministic final tie.
++        """
++        candidates = []
++        protected = []
++        for depth, node in holders:
++            cd = node.component_data[self.component_type]
++            if (
++                node is tail
++                or len(node.children) != 1
++                or cd.lock_ref > 0
++                or cd.session_ref > 0
++                or cd.metadata.get(MAMBA_REUSED_KEY)
++                or node.load_back_pending_id is not None
++                or node in self.tree_core.evictable_device_leaves
++            ):
++                protected.append(depth)
++                continue
++            survivors = [d for d, holder in holders if holder is not node]
++            score = (*_path_cap_coverage_score(survivors), -depth, node.id)
++            candidates.append((score, node))
++        chosen = (
++            min(candidates, key=lambda candidate: candidate[0]) if candidates else None
++        )
++        if logger.isEnabledFor(logging.DEBUG):
++            before = [depth for depth, _ in holders]
++            after = [
++                d for d, node in holders if chosen is None or node is not chosen[1]
++            ]
++            logger.debug(
++                "Mamba path cap: tail=%s cap=%d path_start_depth=0 frontier_depth=%d "
++                "holders_before=%s protected=%s candidate_scores=%s chosen=%s "
++                "holders_after=%s max_gap_before=%d max_gap_after=%d",
++                tail.id,
++                self.mamba_max_states_per_path,
++                before[-1],
++                before,
++                protected,
++                [score for score, _ in candidates],
++                chosen[1].id if chosen else None,
++                after,
++                _path_cap_coverage_score(before)[0],
++                _path_cap_coverage_score(after)[0],
++            )
++        return chosen[1] if chosen else None
+ 
+     def redistribute_on_node_split(
+         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index d6e21d4..2941892 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -2554,9 +2554,11 @@ class ServerArgs:
+     mamba_max_states_per_path: A[
+         int,
+         "Maximum number of cached Mamba states retained per root-to-tail path "
+-        "(-1 means unlimited). When enabled, after each insert the shallowest eligible "
+-        "interior states beyond the cap are removed while their full KV remains. "
+-        "Tail, fork, and locked nodes are preserved. Must be -1 or a positive integer.",
++        "(-1 means unlimited). After each insert, remove replaceable checkpoints "
++        "to minimize the maximum replay gap; quantile deviation breaks ties. "
++        "Full KV and the newest frontier remain. Forks, locks, session references, "
++        "reused states and load-back pins can cause soft-cap overflow. "
++        "Must be -1 or a positive integer.",
+         NS("exec.mamba"),
+     ] = -1
+     enable_mamba_cache_stochastic_rounding: A[
+diff --git a/test/manual/mem_cache/benchmark_mamba_path_cap.py b/test/manual/mem_cache/benchmark_mamba_path_cap.py
+new file mode 100644
+index 0000000..da45f4a
+--- /dev/null
++++ b/test/manual/mem_cache/benchmark_mamba_path_cap.py
+@@ -0,0 +1,207 @@
++"""CPU policy A/B on real tree, eviction and prefix-match code; no model timing.
++
++Run with python/ on PYTHONPATH. JSON goes to stdout. The legacy arm models
++the pre-0012 shallow-first cap; both arms use the current global eviction.
++Diagnostic probes do not refresh recency or mark checkpoints as reused.
++"""
++
++import argparse
++import json
++import statistics
++import sys
++import time
++from array import array
++from collections import defaultdict
++from pathlib import Path
++from types import SimpleNamespace
++
++sys.path.insert(
++    0, str(Path(__file__).resolve().parents[2] / "registered/unit/mem_cache")
++)
++
++from test_mamba_eviction_fairness import FULL, MAMBA, _append_path, _evict, _tree
++
++from sglang.srt.mem_cache.radix_cache import RadixKey
++from sglang.srt.mem_cache.unified_cache.components.tree_component import EvictLayer
++
++
++def legacy_cap(component, tail, device, host):
++    """The previous root-to-tail shallow-first policy, for this A/B only."""
++    holders = []
++    node = tail
++    while node is not component.tree_core.root_node:
++        if node.component_data[MAMBA].value is not None:
++            holders.append(node)
++        node = node.parent
++    excess = len(holders) - component.mamba_max_states_per_path
++    tracker = defaultdict(int)
++    for node in reversed(holders):
++        if excess <= 0 or node is tail:
++            break
++        if node.component_data[MAMBA].lock_ref > 0 or len(node.children) != 1:
++            continue
++        if node in component.tree_core.evictable_device_leaves:
++            continue
++        component.tree_core._evict_component_and_detach_lru(
++            node, component, device, host, target=EvictLayer.DEVICE, tracker=tracker
++        )
++        component.tree_core._cascade_evict(node, component, tracker, device, host)
++        excess -= 1
++
++
++def chain(core, tail):
++    nodes = []
++    while tail is not core.root_node:
++        nodes.append(tail)
++        tail = tail.parent
++    return list(reversed(nodes))
++
++
++def geometry(core, tail):
++    depth, retained = 0, []
++    for node in chain(core, tail):
++        depth += len(node.key)
++        if node.component_data[MAMBA].value is not None:
++            retained.append(depth)
++    points = [0, *retained]
++    if points[-1] != depth:
++        points.append(depth)
++    return retained, max((b - a for a, b in zip(points, points[1:])), default=0)
++
++
++def run(policy, sessions, pool_size, turns, cap, execution_slots):
++    core, component = _tree()
++    component.cache = SimpleNamespace(tree_components=core.component_types)
++    component.mamba_max_states_per_path = cap
++    budget = pool_size - execution_slots
++    tails = [core.root_node] * sessions
++    cap_evicted = pressure_evicted = peak = settled_peak = frontier_rebuilds = 0
++    probes = []
++    cap_us = []
++    snapshots = []
++    for turn in range(turns):
++        for session in range(sessions):
++            occupied = core.component_evictable_size_[MAMBA]
++            # Reserve space before committing the new persistent checkpoint.
++            shortage = max(0, occupied + 1 - budget)
++            if shortage:
++                freed, _ = _evict(core, shortage)
++                assert len(freed) == shortage
++                pressure_evicted += len(freed)
++            tail = tails[session]
++            # Global Mamba pressure can delete a device leaf, including Full
++            # KV. Model its recomputation on the next turn, retaining original
++            # prefix tokens and committing only the new frontier checkpoint.
++            missing = []
++            while tail is not core.root_node and (
++                tail.id not in core._node_arena
++                or tail.component_data[FULL].value is None
++            ):
++                missing.append(tail.key.token_ids)
++                tail = tail.parent
++            increment = (2048, 4096, 3072, 5120)[(turn + session) % 4]
++            restored_tokens = array("q")
++            for tokens in reversed(missing):
++                restored_tokens.extend(tokens)
++            tail = _append_path(core, [len(restored_tokens) + increment], parent=tail)[
++                0
++            ]
++            if missing:
++                frontier_rebuilds += 1
++                tail.parent.children.pop(tail.key.child_key(core.page_size))
++                restored_tokens.extend([tail.id] * increment)
++                tail.key = RadixKey(restored_tokens)
++                tail.parent.children[tail.key.child_key(core.page_size)] = tail
++            tails[session] = tail
++            peak = max(peak, core.component_evictable_size_[MAMBA])
++            device, host = defaultdict(list), defaultdict(list)
++            begin = time.perf_counter_ns()
++            if policy == "legacy":
++                legacy_cap(component, tail, device, host)
++            else:
++                component._evict_excess_path_states(tail, device, host)
++            cap_us.append((time.perf_counter_ns() - begin) / 1000)
++            cap_evicted += len(device[MAMBA])
++            settled_peak = max(settled_peak, core.component_evictable_size_[MAMBA])
++            assert len(geometry(core, tail)[0]) <= cap
++            assert core.component_evictable_size_[MAMBA] <= budget
++
++        if turn >= 3:
++            for session, tail in enumerate(tails):
++                tokens = array("q")
++                for node in chain(core, tail):
++                    tokens.extend(node.key.token_ids)
++                for percent in (25, 50, 75, 90):
++                    query_len = len(tokens) * percent // 100
++                    values, _, _, parts, _, _ = core._match_prefix_helper(
++                        RadixKey(tokens[:query_len])
++                    )
++                    hit = sum(len(value) for value in values[:parts])
++                    probes.append(
++                        {
++                            "turn": turn + 1,
++                            "session": session,
++                            "query_tokens": query_len,
++                            "hit_tokens": hit,
++                            "replay_tokens": query_len - hit,
++                        }
++                    )
++        snapshots.append(
++            {
++                "turn": turn + 1,
++                "occupied_cached_slots": core.component_evictable_size_[MAMBA],
++                "sessions": [
++                    {
++                        "session": i,
++                        "retained_depths": geometry(core, tail)[0],
++                        "max_replay_gap": geometry(core, tail)[1],
++                    }
++                    for i, tail in enumerate(tails)
++                ],
++            }
++        )
++
++    return {
++        "policy": policy,
++        "sessions": sessions,
++        "turns": turns,
++        "cap": cap,
++        "pool_size": pool_size,
++        "reserved_execution_slots": execution_slots,
++        "cached_slot_budget": budget,
++        "peak_cached_slots_including_new_candidate": peak,
++        "peak_cached_slots_after_cap": settled_peak,
++        "cap_evictions": cap_evicted,
++        "global_pressure_evictions": pressure_evicted,
++        "frontier_rebuilds_after_global_leaf_eviction": frontier_rebuilds,
++        "partial_hit_rate": sum(0 < p["hit_tokens"] < p["query_tokens"] for p in probes)
++        / len(probes),
++        "zero_hit_rate": sum(p["hit_tokens"] == 0 for p in probes) / len(probes),
++        "mean_replay_tokens": statistics.mean(p["replay_tokens"] for p in probes),
++        "cpu_cap_decision_median_us": statistics.median(cap_us),
++        "ttft_ms": None,
++        "snapshots": snapshots,
++        "probes": probes,
++    }
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--turns", type=int, default=24)
++    parser.add_argument("--cap", type=int, default=3)
++    args = parser.parse_args()
++    if args.turns < 4 or args.cap < 1:
++        parser.error("use at least four turns and a positive cap")
++    print(
++        json.dumps(
++            {
++                "scope": "Synthetic CPU tree policy; resident Full KV, independent paths, no locks/session pins/real reuse marks. Prefix probes assess replay capability; no GPU inference. Execution reserve is a modeling input, not measured allocator demand. TTFT is unmeasured; replay tokens are a work proxy.",
++                "scenarios": [
++                    run(policy, sessions, pool, args.turns, args.cap, 4)
++                    for sessions, pool in ((4, 16), (8, 24), (12, 32))
++                    for policy in ("legacy", "coverage")
++                ],
++            },
++            indent=2,
++        )
++    )
+diff --git a/test/registered/unit/mem_cache/test_mamba_path_cap_coverage.py b/test/registered/unit/mem_cache/test_mamba_path_cap_coverage.py
+new file mode 100644
+index 0000000..185c1c6
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_mamba_path_cap_coverage.py
+@@ -0,0 +1,280 @@
++"""Coverage-cap decisions on CPU trees, including global-eviction integration."""
++
++import itertools
++import unittest
++from array import array
++from collections import defaultdict
++from fractions import Fraction
++from types import SimpleNamespace
++
++from test_mamba_eviction_fairness import FULL, MAMBA, _append_path, _evict, _lru, _tree
++
++from sglang.srt.mem_cache.radix_cache import RadixKey
++from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
++    MAMBA_REUSED_KEY,
++    _path_cap_coverage_score,
++)
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=3, suite="base-a-test-cpu")
++
++
++def _setup(cap=3, *, sessions=False):
++    core, component = _tree(sessions=sessions)
++    component.cache = SimpleNamespace(tree_components=core.component_types)
++    component.mamba_max_states_per_path = cap
++    return core, component
++
++
++def _path(core, depths, parent=None):
++    previous = 0
++    lengths = []
++    for depth in depths:
++        lengths.append(depth - previous)
++        previous = depth
++    return _append_path(core, lengths, parent=parent)
++
++
++def _cap(component, tail):
++    device, host = defaultdict(list), defaultdict(list)
++    component._evict_excess_path_states(tail, device, host)
++    return [int(value.item()) for value in device[MAMBA]]
++
++
++def _depths(path):
++    result = []
++    depth = 0
++    for node in path:
++        depth += len(node.key)
++        if node.component_data[MAMBA].value is not None:
++            result.append(depth)
++    return result
++
++
++class TestMambaPathCapCoverage(unittest.TestCase):
++    def test_basic_example_replaces_near_frontier_not_oldest(self):
++        core, component = _setup()
++        path = _path(core, [20, 40, 60, 70])
++        self.assertEqual(_cap(component, path[-1]), [path[2].id])
++        self.assertEqual(_depths(path), [20, 40, 70])
++        # The old shallow-first policy left [40, 60, 70], with a gap of 40.
++        self.assertEqual(_path_cap_coverage_score(_depths(path))[0], 30)
++
++    def test_exhaustive_small_paths_match_global_minimax_and_tiebreaks(self):
++        for count in (2, 3, 4):
++            for depths in itertools.combinations(range(1, 9), count + 1):
++                core, component = _setup(count)
++                path = _path(core, depths)
++                # Independent exhaustive survivor oracle, with exact fractions.
++                choices = []
++                for victim in range(count):
++                    kept = [d for i, d in enumerate(depths) if i != victim]
++                    gaps = [b - a for a, b in zip([0, *kept], kept)]
++                    deviation = sum(
++                        abs(Fraction(d) - Fraction(rank * kept[-1], count))
++                        for rank, d in enumerate(kept, 1)
++                    )
++                    choices.append(((max(gaps), deviation, -depths[victim]), victim))
++                expected = min(choices)[1]
++                self.assertEqual(_cap(component, path[-1]), [path[expected].id], depths)
++
++    def test_whole_path_score_differs_from_local_neighbour_gap(self):
++        core, component = _setup(4)
++        path = _path(core, [10, 11, 20, 30, 100])
++        # The 30->100 gap dominates globally. Local merging prefers depth 11;
++        # equal global maxima instead choose depth 10 by quantile deviation.
++        self.assertIs(component._thinning_victim(path[0]), path[1])
++        self.assertEqual(_cap(component, path[-1]), [path[0].id])
++
++    def test_integer_score_handles_large_depths_and_nonzero_origin(self):
++        start = 2**60
++        self.assertEqual(
++            _path_cap_coverage_score([start + 20, start + 40, start + 70], start),
++            (30, 30),
++        )
++
++    def test_equal_geometry_keeps_older_history(self):
++        for sessions in (False, True):
++            core, component = _setup(2, sessions=sessions)
++            path = _path(core, [1, 2, 3])
++            for node in path:
++                core.lru_lists[MAMBA].reset_node_mru(node)
++            self.assertEqual(_cap(component, path[-1]), [path[1].id])
++            self.assertEqual(_depths(path), [1, 3])
++
++    def test_growing_frontier_moves_anchors_and_never_exceeds_cap(self):
++        core, component = _setup()
++        path = []
++        previous = 0
++        snapshots = []
++        for frontier in (20, 40, 60, 70, 90, 120, 160, 200, 260, 320):
++            path.extend(
++                _append_path(
++                    core, [frontier - previous], parent=path[-1] if path else None
++                )
++            )
++            _cap(component, path[-1])
++            retained = _depths(path)
++            self.assertLessEqual(len(retained), 3)
++            self.assertEqual(retained[-1], frontier)
++            snapshots.append(retained)
++            previous = frontier
++        self.assertEqual(snapshots[3], [20, 40, 70])
++        self.assertGreater(snapshots[-1][0], 20)
++        self.assertLess(snapshots[-1][0], 200)
++        self.assertLessEqual(_path_cap_coverage_score(snapshots[-1])[0], 160)
++
++    def test_each_existing_protection_excludes_geometrically_best_victim(self):
++        for protection in (
++            "reused",
++            "fork",
++            "locked",
++            "session",
++            "load_back",
++            "device_leaf",
++        ):
++            with self.subTest(protection=protection):
++                core, component = _setup(sessions=True)
++                path = _path(core, [20, 40, 60, 70])
++                node = path[2]
++                cd = node.component_data[MAMBA]
++                if protection == "reused":
++                    cd.metadata[MAMBA_REUSED_KEY] = True
++                elif protection == "fork":
++                    _append_path(core, [1], parent=node)
++                elif protection == "locked":
++                    cd.lock_ref = 1
++                elif protection == "session":
++                    cd.session_ref = 1
++                    component._refresh_session_partition(node)
++                elif protection == "load_back":
++                    node.load_back_pending_id = node.id
++                else:
++                    core.evictable_device_leaves.add(node)
++                freed = _cap(component, path[-1])
++                self.assertEqual(len(freed), 1)
++                self.assertNotIn(node.id, freed)
++                self.assertIsNotNone(cd.value)
++                self.assertEqual(_depths(path)[-1], 70)
++
++    def test_cap_one_always_keeps_frontier_even_when_internal(self):
++        core, component = _setup(1)
++        path = _path(core, [20, 40, 60, 70])
++        child = _append_path(core, [10], parent=path[-1])[0]
++        self.assertEqual(len(_cap(component, path[-1])), 3)
++        self.assertEqual(_depths(path), [70])
++        self.assertIsNotNone(child.component_data[MAMBA].value)
++
++    def test_cap_two_keeps_history(self):
++        core, component = _setup(2)
++        path = _path(core, [20, 40, 60, 70])
++        _cap(component, path[-1])
++        self.assertEqual(_depths(path), [40, 70])
++
++    def test_protected_overflow_and_later_unlock(self):
++        core, component = _setup(1)
++        path = _path(core, [20, 40, 60, 70])
++        for node in path[:-1]:
++            node.component_data[MAMBA].lock_ref = 1
++        self.assertEqual(_cap(component, path[-1]), [])
++        self.assertEqual(len(_depths(path)), 4)
++        for node in path[:-1]:
++            node.component_data[MAMBA].lock_ref = 0
++        self.assertEqual(len(_cap(component, path[-1])), 3)
++        self.assertEqual(_depths(path), [70])
++
++    def test_shared_fork_and_other_branch_are_untouched(self):
++        core, component = _setup()
++        trunk = _path(core, [100])
++        left = _path(core, [20, 40, 60, 70], parent=trunk[0])
++        right = _path(core, [30, 80], parent=trunk[0])
++        _cap(component, left[-1])
++        self.assertIsNotNone(trunk[0].component_data[MAMBA].value)
++        self.assertEqual(_depths(right), [30, 80])
++        self.assertLessEqual(len(_depths(trunk + left)), 3)
++        self.assertEqual(_depths(trunk + left)[-1], 170)
++
++    def test_host_backup_full_kv_and_real_recency_are_preserved(self):
++        core, component = _setup()
++        path = _path(core, [20, 40, 60, 70])
++        victim = path[2]
++        victim.component_data[MAMBA].host_value = victim.component_data[
++            MAMBA
++        ].value.clone()
++        backup = victim.component_data[MAMBA].host_value
++        full = [n.component_data[FULL].value for n in path]
++        times = [n.last_access_time for n in path]
++        lru = _lru(core)
++        _cap(component, path[-1])
++        self.assertIs(victim.component_data[MAMBA].host_value, backup)
++        self.assertTrue(core.host_lru_lists[MAMBA].in_list(victim))
++        self.assertTrue(
++            all(n.component_data[FULL].value is v for n, v in zip(path, full))
++        )
++        self.assertEqual([n.last_access_time for n in path], times)
++        self.assertEqual(_lru(core), [n for n in lru if n is not victim])
++
++    def test_tombstones_do_not_count_but_their_key_lengths_do(self):
++        core, component = _setup()
++        path = _path(core, [20, 40, 60, 70])
++        cd = path[1].component_data[MAMBA]
++        cd.host_value, cd.value = cd.value, None
++        core.lru_lists[MAMBA].remove_node(path[1])
++        core.component_evictable_size_[MAMBA] -= 1
++        self.assertEqual(_cap(component, path[-1]), [])
++        next_node = _append_path(core, [20], parent=path[-1])[0]
++        path.append(next_node)
++        _cap(component, next_node)
++        self.assertEqual(_depths(path), [20, 60, 90])
++
++    def test_capped_paths_still_share_global_pressure(self):
++        for sessions in (False, True):
++            core, component = _setup(sessions=sessions)
++            paths = [_path(core, [20, 40, 60, 70]) for _ in range(4)]
++            for path in paths:
++                _cap(component, path[-1])
++            self.assertTrue(all(_depths(p) == [20, 40, 70] for p in paths))
++            expected = [component._thinning_victim(p[0]).id for p in paths]
++            freed, _ = _evict(core, 4)
++            self.assertEqual(freed, expected)
++            self.assertTrue(all(len(_depths(p)) == 2 for p in paths))
++            _evict(core, 2)
++            self.assertEqual(_depths(paths[0]), [])
++            self.assertTrue(all(len(_depths(p)) == 2 for p in paths[1:]))
++
++    def test_retained_checkpoint_serves_partial_prefix(self):
++        core, component = _setup()
++        path = _path(core, [20, 40, 60, 70])
++        _cap(component, path[-1])
++        key = RadixKey(
++            array(
++                "q",
++                [n.id for n in path[:3] for _ in range(len(n.key))] + [path[3].id] * 5,
++            )
++        )
++        values, _, best_device, parts, _, _ = core._match_prefix_helper(key)
++        self.assertIs(best_device, path[1])
++        self.assertEqual(sum(len(v) for v in values[:parts]), 40)
++
++    def test_debug_decision_reports_geometry_and_protection(self):
++        core, component = _setup()
++        path = _path(core, [20, 40, 60, 70])
++        with self.assertLogs(
++            "sglang.srt.mem_cache.unified_cache.components.mamba_component",
++            level="DEBUG",
++        ) as logs:
++            _cap(component, path[-1])
++        text = "\n".join(logs.output)
++        for field in (
++            "path_start_depth=0",
++            "frontier_depth=70",
++            "protected=[70]",
++            "candidate_scores=",
++            "holders_after=[20, 40, 70]",
++            "max_gap_after=30",
++        ):
++            self.assertIn(field, text)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/mem_cache/test_mamba_path_state_cap.py b/test/registered/unit/mem_cache/test_mamba_path_state_cap.py
+index f30f2bd..bf883ae 100644
+--- a/test/registered/unit/mem_cache/test_mamba_path_state_cap.py
++++ b/test/registered/unit/mem_cache/test_mamba_path_state_cap.py
+@@ -7,12 +7,14 @@ register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+ 
+ import argparse
+ import unittest
++from array import array
+ from collections import defaultdict
+ from unittest import mock
+ 
+ import torch
+ from test_unified_radix_cache_unittest import CacheConfig, UnifiedRadixCacheSuite
+ 
++from sglang.srt.mem_cache.radix_cache import RadixKey
+ from sglang.srt.mem_cache.unified_cache.cache_action import MambaEvictExcessPathStates
+ from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
+     MambaComponent,
+@@ -74,6 +76,7 @@ def _build_unified_chain(cap, length=3):
+     for index in range(length):
+         node = UnifiedTreeNode(core.tree_components)
+         node.parent = parent
++        node.key = RadixKey(array("q", [index]))
+         node.component_data[ComponentType.FULL].value = torch.tensor([100 + index])
+         node.component_data[ComponentType.MAMBA].value = torch.tensor([index])
+         parent.children[index] = node
+@@ -110,23 +113,23 @@ class TestMambaPathStateCap(unittest.TestCase):
+             ):
+                 args._handle_mamba_backend()
+ 
+-    def test_unified_cache_removes_only_shallow_mamba_state(self):
++    def test_unified_cache_keeps_spread_mamba_states_and_full_kv(self):
+         component, nodes, core, cache = _build_unified_chain(cap=2)
+ 
+         device_frees = defaultdict(list)
+         host_frees = defaultdict(list)
+         component._evict_excess_path_states(nodes[-1], device_frees, host_frees)
+ 
+-        self.assertEqual(core.evicted, [nodes[0]])
+-        self.assertEqual(core.cascaded, [nodes[0]])
+-        self.assertIsNone(nodes[0].component_data[ComponentType.MAMBA].value)
++        self.assertEqual(core.evicted, [nodes[1]])
++        self.assertEqual(core.cascaded, [nodes[1]])
++        self.assertIsNone(nodes[1].component_data[ComponentType.MAMBA].value)
+         self.assertIsNotNone(nodes[-1].component_data[ComponentType.MAMBA].value)
+         self.assertEqual(
+             [v.item() for v in device_frees[ComponentType.MAMBA]],
+-            [0],
++            [1],
+         )
+         self.assertEqual(core.component_evictable_size_[ComponentType.MAMBA], 2)
+-        self.assertFalse(core.lru_lists[ComponentType.MAMBA].in_list(nodes[0]))
++        self.assertFalse(core.lru_lists[ComponentType.MAMBA].in_list(nodes[1]))
+         self.assertTrue(
+             all(
+                 node.component_data[ComponentType.FULL].value is not None
+@@ -153,7 +156,7 @@ class TestMambaPathStateCap(unittest.TestCase):
+ 
+     def test_unified_cache_preserves_existing_host_backup(self):
+         component, nodes, core, cache = _build_unified_chain(cap=2)
+-        mamba_data = nodes[0].component_data[ComponentType.MAMBA]
++        mamba_data = nodes[1].component_data[ComponentType.MAMBA]
+         mamba_data.host_value = torch.tensor([10])
+ 
+         device_frees = defaultdict(list)
+@@ -162,7 +165,7 @@ class TestMambaPathStateCap(unittest.TestCase):
+ 
+         self.assertIsNone(mamba_data.value)
+         self.assertIsNotNone(mamba_data.host_value)
+-        self.assertTrue(core.host_lru_lists[ComponentType.MAMBA].in_list(nodes[0]))
++        self.assertTrue(core.host_lru_lists[ComponentType.MAMBA].in_list(nodes[1]))
+ 
+     def test_unified_cache_negative_one_disables_cap(self):
+         component, nodes, core, cache = _build_unified_chain(cap=-1)

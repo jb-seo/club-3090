@@ -1,6 +1,6 @@
 # `sglang-v0518-scheduling-and-logging`
 
-Eleven patches applied to SGLang **inside the container** at startup by
+Twelve patches applied to SGLang **inside the container** at startup by
 `install.sh`, which the compose runs before `launch_server`. Nothing to
 install on the host.
 
@@ -8,9 +8,9 @@ Base is **v0.5.18** (`71de97b264`). The compose pins `lmsysorg/sglang:v0.5.18`
 for that reason: `:latest` is already past it — as of 2026-09-04 `:latest` and
 `:v0.5.19` share a digest (`sha256:d6e72886...3eda9`).
 
-`bash install.sh --verify` reports which of the eleven are present, changing
+`bash install.sh --verify` reports which of the twelve are present, changing
 nothing. Rerunning `install.sh` upgrades a container with a complete prefix
-of three through ten patches by applying only the remaining patches.
+of three through eleven patches by applying only the remaining patches.
 
 ## Why patches, not a fork checkout
 
@@ -40,6 +40,7 @@ tag when moving the pin — do not force them.
 | `0009-mamba-protect-reused-states.patch` | Marks reused Mamba states and excludes them from deeper thinning victims. |
 | `0010-fix-mamba-demand-v0518-request-fields.patch` | Corrects `0007` to use v0.5.18's request-level Mamba fields; fixes the first-prefill `req.kv is None` crash. Includes regression tests using real `Req` objects. |
 | `0011-mamba-inter-path-eviction-fairness.patch` | Spreads Mamba eviction across cold paths, retaining two usable checkpoints per path while possible, with a hard-pressure LRU fallback. |
+| `0012-mamba-path-cap-minimax-coverage.patch` | Changes the insertion-time per-path cap to minimize the maximum replay gap, with deterministic quantile ties and protected checkpoints. Includes unit tests and a synthetic policy A/B. |
 
 `0001`–`0004` are scoped to `python/sglang/`. `0005`/`0006` retain their
 upstream tests and original format-patch author/commit metadata. Their bytes
@@ -132,6 +133,13 @@ freed or a device leaf is returned to the driver. The upstream Rust radix-tree
 changes and integration tests are omitted because v0.5.18 has no such backend.
 Both PRs' Python unit tests are included.
 
+PR #32606 is intentionally absent. It was closed without merge after #34043
+and #34184 fixed the same prefill-graph tracking problem more completely, and
+both successors already ship in v0.5.18. Applying #32606 here would restore
+the obsolete speculative-decoding exclusion in `_is_mamba_track_enabled()`,
+undo part of #34043 and send affected prefills through eager execution. The
+source commits and ancestry check are recorded in `docs/UPSTREAM.md`.
+
 Local validation (2026-09-11): the installer regression suite passes 11 tests,
 including fresh v0.5.18 installation, upgrades from three through eight
 patches, repeated installation, read-only verification and rejection of
@@ -172,6 +180,10 @@ bash /workspace/club-3090/models/qwen3.8-27b/sglang/scripts/run_in_runpot.sh
 ```
 
 ### Inter-path Mamba eviction fairness (`0011`, 2026-09-11)
+
+This section records the eleven-patch policy. Its insertion-cap comparison
+uses the old shallow-first cap; `0012` below changes that cap to coverage
+selection. The global fairness policy itself remains the same.
 
 The coverage selector from `0008`/`0009` can repeatedly thin the same cold
 path in one allocation episode. `0011` adds eviction-local LRU sweeps above
@@ -246,6 +258,67 @@ and five GPU tests skip in the local v0.5.18 container. All 14 installer tests
 pass, including fresh installation, upgrades from three through ten patches,
 idempotence and rejection of drift. GPU serving, TP2 behavior under load and
 real-workload cache-hit distributions remain unmeasured for this policy.
+
+### Coverage-aware insertion cap (`0012`, 2026-09-11)
+
+`--mamba-max-states-per-path=N` now bounds checkpoints after each insertion
+by replay coverage. With depths 20, 40, 60 and a new frontier at 70, `N=3`
+removes 60 and retains **20, 40, 70**, reducing the worst gap from the old
+policy's 40 to 30. This happens during the existing insert action, even when
+the global pool still has free slots.
+
+Each replaceable old holder is scored against **all survivors** from root
+depth zero to the mandatory frontier. The score is ordered by maximum gap,
+total absolute deviation from uniform quantiles, deeper victim first, then
+node ID. Quantile deviation uses integer scaling by the survivor count, so
+the decision needs no floating-point comparison or device synchronization.
+The primary objective is whole-path minimax, not #38000's local merged gap.
+If multiple excess holders exist, the selector recomputes after each victim;
+it is an online greedy policy over available states, not an optimizer that
+can recreate previously evicted checkpoints.
+
+The frontier, forks, locks, session references, reused states, load-back
+pins and protected device leaves cannot be selected. Mandatory holders can
+exceed the numeric cap. They naturally partition replay gaps, but this first
+implementation scores the root-to-tail path and global quantiles; it does
+not introduce a separate optimization domain at each mandatory ancestor.
+Full KV, host backups, slot allocation, #38000 and inter-path fairness keep
+their existing behavior. There is **no Rust radix-tree backend in v0.5.18**;
+this patch targets the Python implementation actually present in this tree.
+
+Backup ordering is unchanged: the action runs after the insert's walk-time
+BackupKV, preserving its locks, and uses the existing failure-safe free
+drain. A new checkpoint can temporarily require **N+1 persistent slots**
+before reduction; admission-time victim-slot reuse is deferred. A full pool
+may therefore still invoke global eviction before this cap can run.
+
+For the requested three-checkpoint setting, update the recipe checkout after
+publication and append the override to the launcher (the compose still uses
+2). Omitting the flag directly in SGLang means unlimited; omitting launcher
+arguments still inherits the compose value.
+
+```bash
+bash /workspace/club-3090/models/qwen3.8-27b/sglang/scripts/run_in_runpot.sh \
+  --mamba-max-states-per-path=3
+```
+
+Enable DEBUG for
+`sglang.srt.mem_cache.unified_cache.components.mamba_component` to inspect
+tail ID, cap, root/frontier depths, holders, protected depths, candidate
+scores `(max_gap, scaled_deviation, -depth, node_id)`, chosen victim and
+before/after maximum gaps. Default logging adds no per-decision INFO output.
+
+Validation: 16 new test methods include 182 exhaustive small-path choices,
+growing frontiers, protections, soft overflow, host/Full KV preservation,
+actual partial prefix matching and global pressure/fairness integration.
+The combined runtime suite passes 55 tests with five GPU backup tests skipped;
+the local container's CUDA initialization fails with error 500, so those
+ordering tests were not executed on GPU. All 17 installer tests pass,
+including fresh v0.5.18, three-through-eleven-patch upgrades and rejection
+of partial/modified `0012`. Existing `0001`–`0011` remain byte-identical.
+The [synthetic A/B report](validation/mamba-path-cap-2026-09-11.md) records
+slot occupancy, per-session geometry, partial/zero hits and replay work.
+GPU serving, numerical correctness, TP2 throughput and TTFT are unmeasured.
 
 ## DFlash2 backports (`0005` / `0006`)
 
