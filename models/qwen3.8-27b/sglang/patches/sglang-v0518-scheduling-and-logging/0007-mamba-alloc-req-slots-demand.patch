@@ -1,0 +1,175 @@
+From fc84595d72db72c41164de3d6f77e85eea992d36 Mon Sep 17 00:00:00 2001
+From: alphabetc1 <2508695655@qq.com>
+Date: Sat, 5 Sep 2026 20:05:47 +0800
+Subject: [PATCH] fix: evict only the mamba slots a prefill batch will actually
+ allocate
+
+---
+ python/sglang/srt/mem_cache/allocation.py     | 40 ++++++---
+ .../test_mamba_alloc_req_slots_demand.py      | 89 +++++++++++++++++++
+ 2 files changed, 116 insertions(+), 13 deletions(-)
+ create mode 100644 test/registered/unit/mem_cache/test_mamba_alloc_req_slots_demand.py
+
+diff --git a/python/sglang/srt/mem_cache/allocation.py b/python/sglang/srt/mem_cache/allocation.py
+index fc5428a34a..121d60334c 100644
+--- a/python/sglang/srt/mem_cache/allocation.py
++++ b/python/sglang/srt/mem_cache/allocation.py
+@@ -19,9 +19,6 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+ )
+ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+ from sglang.srt.mem_cache.common import (
+-    MAMBA_STATE_PER_REQ_NO_CACHE,
+-    MAMBA_STATE_PER_REQ_PREFIX_CACHE,
+-    MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
+     available_and_evictable_str,
+     evict_from_tree_cache,
+ )
+@@ -227,6 +224,30 @@ def alloc_paged_token_slots_extend(
+     return out_cache_loc
+ 
+ 
++def mamba_slots_needed(
++    *, req_to_token_pool: HybridReqToTokenPool, reqs: list[Req]
++) -> int:
++    """Mamba slots ``HybridReqToTokenPool.alloc`` takes for this batch: an
++    active state for each request without one (a COW match already holds it),
++    plus the ping-pong buffer for each request that has none yet. A chunked
++    continuation holds both, so admitting it evicts nothing."""
++    if req_to_token_pool.enable_mamba_extra_buffer:
++        ping_pong_slots = (
++            1
++            if req_to_token_pool.enable_mamba_extra_buffer_lazy
++            else req_to_token_pool.mamba_ping_pong_track_buffer_size
++        )
++    else:
++        ping_pong_slots = 0
++    needed = 0
++    for req in reqs:
++        if not req.kv.holds_mamba:
++            needed += 1
++        if req.kv.mamba_ping_pong_track_buffer is None:
++            needed += ping_pong_slots
++    return needed
++
++
+ def alloc_req_slots(
+     req_to_token_pool: ReqToTokenPool,
+     reqs: list[Req],
+@@ -245,16 +266,9 @@ def alloc_req_slots(
+         mamba_available_size = (
+             req_to_token_pool.mamba_allocator.schedulable_available_size()
+         )
+-        # Eviction headroom factor: 3x (or lazy variant) for radix COW, 1x for chunk.
+-        if tree_cache.supports_mamba():
+-            factor = (
+-                MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
+-                if req_to_token_pool.enable_mamba_extra_buffer_lazy
+-                else MAMBA_STATE_PER_REQ_PREFIX_CACHE
+-            )
+-        else:
+-            factor = MAMBA_STATE_PER_REQ_NO_CACHE
+-        mamba_state_needed = num_reqs * factor
++        mamba_state_needed = mamba_slots_needed(
++            req_to_token_pool=req_to_token_pool, reqs=reqs
++        )
+         if mamba_available_size < mamba_state_needed:
+             if tree_cache is not None and tree_cache.supports_mamba():
+                 mamba_num = max(0, mamba_state_needed - mamba_available_size)
+diff --git a/test/registered/unit/mem_cache/test_mamba_alloc_req_slots_demand.py b/test/registered/unit/mem_cache/test_mamba_alloc_req_slots_demand.py
+new file mode 100644
+index 0000000000..396a39c83c
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_mamba_alloc_req_slots_demand.py
+@@ -0,0 +1,89 @@
++"""CPU-only tests for the mamba eviction demand of ``alloc_req_slots``.
++
++Admitting a prefill batch must evict only what ``HybridReqToTokenPool.alloc``
++will actually take. A chunked continuation already holds its active slot and
++ping-pong buffer, and a COW match already holds the active slot; charging
++every request three slots evicted up to three cached checkpoints per chunk
++under a tight pool and starved prefix reuse.
++"""
++
++import unittest
++from types import SimpleNamespace
++
++import torch
++
++from sglang.srt.mem_cache.allocation import alloc_req_slots, mamba_slots_needed
++from sglang.srt.mem_cache.base_prefix_cache import EvictParams
++from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=2, suite="base-a-test-cpu")
++
++
++def _pool(*, extra_buffer=True, lazy=False, overlap=True):
++    return SimpleNamespace(
++        enable_mamba_extra_buffer=extra_buffer,
++        enable_mamba_extra_buffer_lazy=lazy,
++        mamba_ping_pong_track_buffer_size=2 if overlap else 1,
++    )
++
++
++def _req(*, holds_mamba: bool, has_ping_pong: bool):
++    return SimpleNamespace(
++        kv=SimpleNamespace(
++            holds_mamba=holds_mamba,
++            mamba_ping_pong_track_buffer=(
++                torch.tensor([1, 2]) if has_ping_pong else None
++            ),
++        )
++    )
++
++
++NEW = _req(holds_mamba=False, has_ping_pong=False)
++COW = _req(holds_mamba=True, has_ping_pong=False)
++CHUNKED = _req(holds_mamba=True, has_ping_pong=True)
++
++
++class TestMambaSlotsNeeded(unittest.TestCase):
++    def test_demand_counts_only_what_alloc_will_take(self):
++        pool = _pool()
++        self.assertEqual(mamba_slots_needed(req_to_token_pool=pool, reqs=[NEW]), 3)
++        self.assertEqual(mamba_slots_needed(req_to_token_pool=pool, reqs=[COW]), 2)
++        self.assertEqual(mamba_slots_needed(req_to_token_pool=pool, reqs=[CHUNKED]), 0)
++
++
++class _RecordingCache:
++    def __init__(self):
++        self.evict_params = []
++
++    def supports_mamba(self):
++        return True
++
++    def evict_for_alloc(self, params: EvictParams):
++        self.evict_params.append(params)
++
++
++def _hybrid_pool(available: int):
++    """A HybridReqToTokenPool shell: only the fields alloc_req_slots reads."""
++    pool = object.__new__(HybridReqToTokenPool)
++    pool.enable_mamba_extra_buffer = True
++    pool.enable_mamba_extra_buffer_lazy = False
++    pool.mamba_ping_pong_track_buffer_size = 2
++    pool.mamba_allocator = SimpleNamespace(schedulable_available_size=lambda: available)
++    pool.alloc = lambda reqs: list(range(1, len(reqs) + 1))
++    return pool
++
++
++class TestAllocReqSlotsEviction(unittest.TestCase):
++    def test_evicts_only_the_shortfall(self):
++        cache = _RecordingCache()
++        # a chunked continuation holds everything already: nothing to evict
++        alloc_req_slots(_hybrid_pool(available=0), [CHUNKED], cache)
++        self.assertEqual(cache.evict_params, [])
++        # a COW-matched request needs its two ping-pong slots; one is free
++        alloc_req_slots(_hybrid_pool(available=1), [COW], cache)
++        self.assertEqual(cache.evict_params, [EvictParams(num_tokens=0, mamba_num=1)])
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.34.1
+

@@ -1,0 +1,141 @@
+From a50d98ad91ca15fb4c081cfd189c8baec0f8dcfe Mon Sep 17 00:00:00 2001
+From: alphabetc1 <2508695655@qq.com>
+Date: Sat, 5 Sep 2026 01:02:54 +0800
+Subject: [PATCH] fix: never thin a mamba state that another request has
+ matched
+
+---
+ .../components/mamba_component.py             | 25 ++++++++++++----
+ .../unified_cache/unified_tree_core.py        |  6 ++++
+ .../mem_cache/test_mamba_eviction_thinning.py | 30 +++++++++++++++++++
+ 3 files changed, 56 insertions(+), 5 deletions(-)
+
+diff --git a/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py b/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py
+index 7f2b364c94..01ea98b972 100644
+--- a/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py
++++ b/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py
+@@ -55,6 +55,11 @@ if TYPE_CHECKING:
+     )
+ 
+ 
++# ComponentData.metadata flag: a request other than the inserter matched this
++# node's mamba state, so coverage thinning must never pick it.
++MAMBA_REUSED_KEY = "mamba_reused"
++
++
+ class MambaComponent(TreeComponent):
+     component_type = ComponentType.MAMBA
+ 
+@@ -131,8 +136,14 @@ class MambaComponent(TreeComponent):
+             case LRURefreshPhase.WALKDOWN:
+                 return
+             case LRURefreshPhase.MATCH_END:
+-                if node.component_data[ct].value is not None:
+-                    self.tree_core.lru_lists[ct].reset_node_mru(node)
++                cd = node.component_data[ct]
++                if cd.value is not None:
++                    lru = self.tree_core.lru_lists[ct]
++                    # The inserter's own re-match after a chunk insert lands on
++                    # the MRU node; any other match proves the state is reused.
++                    if not lru.is_mru(node):
++                        cd.metadata[MAMBA_REUSED_KEY] = True
++                    lru.reset_node_mru(node)
+             case LRURefreshPhase.INSERT_END:
+                 return
+             case _:
+@@ -440,8 +451,9 @@ class MambaComponent(TreeComponent):
+         leaves the smallest gap between its neighbours keeps that path's
+         checkpoint coverage spread out; a plain tail eviction strips it
+         shallow-first, which is the inverse of what a branch match needs.
+-        Forks, locked, session-referenced and leaf holders are boundaries,
+-        never victims. Returns x when there is nothing better to thin.
++        Forks, locked, session-referenced, reused (matched by another request)
++        and leaf holders are boundaries, never victims. Returns x when there is
++        nothing better to thin.
+         """
+         ct = self.component_type
+         root = self.tree_core.root_node
+@@ -476,7 +488,10 @@ class MambaComponent(TreeComponent):
+         for i, (_, node) in enumerate(holders):
+             cd = node.component_data[ct]
+             if node is not x and (
+-                len(node.children) != 1 or cd.lock_ref > 0 or cd.session_ref > 0
++                len(node.children) != 1
++                or cd.lock_ref > 0
++                or cd.session_ref > 0
++                or cd.metadata.get(MAMBA_REUSED_KEY)
+             ):
+                 continue
+             lo = holders[i - 1][0] if i > 0 else prev_depth
+diff --git a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
+index e39a9e01c3..45e6f6cd51 100644
+--- a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
++++ b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
+@@ -306,6 +306,12 @@ class UnifiedLRUList:
+     def in_list(self, node: Optional[UnifiedTreeNode]):
+         return node is not None and node.id in self.cache
+ 
++    def is_mru(self, node: UnifiedTreeNode) -> bool:
++        """Whether a member node is the most-recently-used of its partition."""
++        assert node.id in self.cache
++        prev = node.lru_prev[self._pt]
++        return prev is self.head or prev is self.mid
++
+     def get_prev_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
+         if check_id:
+             assert node.id in self.cache
+diff --git a/test/registered/unit/mem_cache/test_mamba_eviction_thinning.py b/test/registered/unit/mem_cache/test_mamba_eviction_thinning.py
+index 8187a100a1..2526fe0c71 100644
+--- a/test/registered/unit/mem_cache/test_mamba_eviction_thinning.py
++++ b/test/registered/unit/mem_cache/test_mamba_eviction_thinning.py
+@@ -12,10 +12,12 @@ import torch
+ 
+ from sglang.srt.mem_cache.radix_cache import RadixKey
+ from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
++    MAMBA_REUSED_KEY,
+     MambaComponent,
+ )
+ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+     ComponentType,
++    LRURefreshPhase,
+ )
+ from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+ from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList, UnifiedTreeNode
+@@ -162,6 +164,34 @@ class TestMambaEvictionThinning(CustomTestCase):
+ 
+         self.assertEqual(freed, [2])
+ 
++    def test_state_matched_by_another_request_is_never_thinned(self):
++        """Regression for the shared-prefix hit-rate drop: a group's boundary
++        state is refreshed to MRU by every member's match, but a geometry-only
++        victim rule could still thin it because a member's private tail sits
++        right below it. A MATCH_END on a non-MRU node marks the state reused,
++        and reused states are boundaries for thinning."""
++        component, nodes, core = _build_chain([4, 1, 1, 4])
++        # A later request matches depth 5 (not the MRU node, which is depth 10).
++        component.refresh_lru(LRURefreshPhase.MATCH_END, nodes[1], core.root_node)
++        self.assertTrue(nodes[1].component_data[MAMBA].metadata[MAMBA_REUSED_KEY])
++
++        _, freed = _evict_one(component)
++
++        # Depth 5 would be the min-gap victim (2 vs 5); it is spared, and the
++        # remaining candidates tie so the tail goes as before.
++        self.assertEqual(freed, [1])
++        self.assertIsNotNone(nodes[1].component_data[MAMBA].value)
++
++    def test_inserter_re_match_on_the_mru_node_does_not_mark_reuse(self):
++        """cache_unfinished_req re-matches the node it just inserted; that
++        match must not protect the state or thinning would never apply to an
++        in-flight chain."""
++        component, nodes, core = _build_chain([4, 1, 1, 4])
++        component.refresh_lru(LRURefreshPhase.MATCH_END, nodes[-1], core.root_node)
++
++        self.assertNotIn(MAMBA_REUSED_KEY, nodes[-1].component_data[MAMBA].metadata)
++        self.assertEqual(_evict_one(component)[1], [2])
++
+     def test_device_leaf_at_the_tail_is_still_deleted_as_a_leaf(self):
+         component, nodes, core = _build_chain([1, 1])
+         core.evictable_device_leaves.add(nodes[1])
+-- 
+2.34.1
+

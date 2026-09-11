@@ -1,0 +1,305 @@
+From bc8d756a543c664b6854e4600eb55d57c1b4c700 Mon Sep 17 00:00:00 2001
+From: alphabetc1 <2508695655@qq.com>
+Date: Fri, 4 Sep 2026 18:30:30 +0800
+Subject: [PATCH] fix: thin mamba checkpoints by coverage instead of evicting
+ the LRU tail
+
+---
+ .../components/mamba_component.py             |  91 +++++++--
+ .../mem_cache/test_mamba_eviction_thinning.py | 177 ++++++++++++++++++
+ 2 files changed, 257 insertions(+), 11 deletions(-)
+ create mode 100644 test/registered/unit/mem_cache/test_mamba_eviction_thinning.py
+
+diff --git a/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py b/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py
+index fe5347ac3d..7f2b364c94 100644
+--- a/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py
++++ b/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py
+@@ -401,22 +401,91 @@ class MambaComponent(TreeComponent):
+                     lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
+                 )
+                 return x.id
++            victim = self._thinning_victim(x)
++            if victim is not x:
++                # Keep the cursor on x and re-evaluate its chain until enough
++                # slots are freed or a device leaf is returned to the driver.
++                self._tombstone_device_state(victim, tracker, device_frees, host_frees)
++                continue
+             if not enabled:
+                 x_next = lru.get_prev_no_lock(x)
+-            self.tree_core._evict_component_and_detach_lru(
+-                x,
+-                self,
+-                target=EvictLayer.DEVICE,
+-                tracker=tracker,
+-                device_frees=device_frees,
+-                host_frees=host_frees,
+-            )
+-            self.tree_core._cascade_evict(
+-                x, self, tracker, device_frees=device_frees, host_frees=host_frees
+-            )
++            self._tombstone_device_state(x, tracker, device_frees, host_frees)
+             self._evict_device_cursor = lru.cursor_next() if enabled else x_next
+         return None
+ 
++    def _tombstone_device_state(
++        self,
++        node: UnifiedTreeNode,
++        tracker: dict[ComponentType, int],
++        device_frees: dict[ComponentType, list[torch.Tensor]],
++        host_frees: dict[ComponentType, list[torch.Tensor]],
++    ) -> None:
++        self.tree_core._evict_component_and_detach_lru(
++            node,
++            self,
++            target=EvictLayer.DEVICE,
++            tracker=tracker,
++            device_frees=device_frees,
++            host_frees=host_frees,
++        )
++        self.tree_core._cascade_evict(
++            node, self, tracker, device_frees=device_frees, host_frees=host_frees
++        )
++
++    def _thinning_victim(self, x: UnifiedTreeNode) -> UnifiedTreeNode:
++        """Pick which state of the LRU-oldest node's chain to drop.
++
++        The states below x on its single-child chain belong to the same cold
++        path and are the next to age out, so dropping the one whose removal
++        leaves the smallest gap between its neighbours keeps that path's
++        checkpoint coverage spread out; a plain tail eviction strips it
++        shallow-first, which is the inverse of what a branch match needs.
++        Forks, locked, session-referenced and leaf holders are boundaries,
++        never victims. Returns x when there is nothing better to thin.
++        """
++        ct = self.component_type
++        root = self.tree_core.root_node
++        if len(x.children) != 1:
++            return x
++        depth = 0
++        node = x
++        while node is not root:
++            depth += len(node.key)
++            node = node.parent
++        # Nearest state holder above x (else the root) bounds its gap.
++        prev_depth = 0
++        d = depth
++        node = x
++        while node.parent is not root:
++            d -= len(node.key)
++            node = node.parent
++            if node.component_data[ct].value is not None:
++                prev_depth = d
++                break
++        # (depth, node) for every state holder on the chain, x first.
++        holders = [(depth, x)]
++        node = x
++        while len(node.children) == 1:
++            node = next(iter(node.children.values()))
++            depth += len(node.key)
++            if node.component_data[ct].value is not None:
++                holders.append((depth, node))
++        chain_end = depth
++        victim = x
++        best_gap = None
++        for i, (_, node) in enumerate(holders):
++            cd = node.component_data[ct]
++            if node is not x and (
++                len(node.children) != 1 or cd.lock_ref > 0 or cd.session_ref > 0
++            ):
++                continue
++            lo = holders[i - 1][0] if i > 0 else prev_depth
++            hi = holders[i + 1][0] if i + 1 < len(holders) else chain_end
++            if best_gap is None or hi - lo < best_gap:
++                best_gap = hi - lo
++                victim = node
++        return victim
++
+     def _evict_device_end(self) -> None:
+         """Clear the device-eviction walk cursor state."""
+         if self.tree_core.enable_session_radix_cache:
+diff --git a/test/registered/unit/mem_cache/test_mamba_eviction_thinning.py b/test/registered/unit/mem_cache/test_mamba_eviction_thinning.py
+new file mode 100644
+index 0000000000..8187a100a1
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_mamba_eviction_thinning.py
+@@ -0,0 +1,177 @@
++"""CPU-only unit tests for coverage-preserving Mamba device eviction."""
++
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=2, suite="base-a-test-cpu")
++
++import unittest
++from array import array
++from collections import defaultdict
++
++import torch
++
++from sglang.srt.mem_cache.radix_cache import RadixKey
++from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
++    MambaComponent,
++)
++from sglang.srt.mem_cache.unified_cache.components.tree_component import (
++    ComponentType,
++)
++from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
++from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList, UnifiedTreeNode
++from sglang.test.test_utils import CustomTestCase
++
++MAMBA = ComponentType.MAMBA
++
++
++class _FakeTreeCore:
++    tree_components = (ComponentType.FULL, MAMBA)
++    enable_session_radix_cache = False
++
++    def __init__(self):
++        self.root_node = UnifiedTreeNode(self.tree_components)
++        self.evictable_device_leaves = set()
++        self.component_evictable_size_ = {MAMBA: 0}
++        self.component_protected_size_ = {MAMBA: 0}
++        self.lru_lists = {MAMBA: UnifiedLRUList(MAMBA, self.tree_components)}
++        self.host_lru_lists = {
++            MAMBA: UnifiedLRUList(MAMBA, self.tree_components, use_host_ptr=True)
++        }
++        self.cascaded = []
++        self._is_tracking_unbacked_tokens = False
++        self._tracked_unbacked_tokens = 0
++
++    def _evict_component_and_detach_lru(self, node, component, *args, **kwargs):
++        return UnifiedTreeCore._evict_component_and_detach_lru(
++            self, node, component, *args, **kwargs
++        )
++
++    def _cascade_evict(self, node, component, tracker, device_frees, host_frees):
++        self.cascaded.append(node)
++
++
++def _build_chain(key_lens):
++    """A root-to-leaf chain, one mamba state per node, inserted into the LRU
++    in chain order so the shallowest node is the LRU tail. State slot i is the
++    node's 1-based chain position."""
++    core = _FakeTreeCore()
++    component = object.__new__(MambaComponent)
++    component.tree_core = core
++    nodes = []
++    parent = core.root_node
++    for index, key_len in enumerate(key_lens):
++        node = UnifiedTreeNode(core.tree_components)
++        node.parent = parent
++        node.key = RadixKey(token_ids=array("q", [index] * key_len))
++        node.component_data[ComponentType.FULL].value = torch.tensor([index])
++        node.component_data[MAMBA].value = torch.tensor([index + 1])
++        parent.children[index] = node
++        core.component_evictable_size_[MAMBA] += 1
++        core.lru_lists[MAMBA].insert_mru(node)
++        nodes.append(node)
++        parent = node
++    return component, nodes, core
++
++
++def _evict_one(component):
++    """One eviction round of one slot; returns (leaf id or None, freed slots)."""
++    device_frees = defaultdict(list)
++    host_frees = defaultdict(list)
++    tracker = {ComponentType.FULL: 0, MAMBA: 0}
++    component._evict_device_start(1)
++    node_id = component._evict_device_next_node(tracker, device_frees, host_frees)
++    component._evict_device_end()
++    return node_id, [int(v.item()) for v in device_frees[MAMBA]]
++
++
++class TestMambaEvictionThinning(CustomTestCase):
++    def test_uniform_chain_is_thinned_to_alternate_states(self):
++        """Regression for #36935: under pool pressure a cold chain used to lose
++        its states shallow-first, so a branch matching its prefix found no
++        checkpoint. Thinning drops every other state instead, so the survivors
++        stay spread along the chain."""
++        component, nodes, core = _build_chain([1] * 8)
++
++        freed = [_evict_one(component)[1] for _ in range(4)]
++
++        self.assertEqual(freed, [[1], [3], [5], [7]])
++        survivors = [n for n in nodes if n.component_data[MAMBA].value is not None]
++        self.assertEqual(survivors, [nodes[1], nodes[3], nodes[5], nodes[7]])
++        self.assertEqual(core.component_evictable_size_[MAMBA], 4)
++        self.assertTrue(
++            all(
++                node.component_data[ComponentType.FULL].value is not None
++                for node in nodes
++            )
++        )
++
++    def test_victim_minimizes_the_merged_gap(self):
++        """Depths 4, 5, 6, 10: removing the node at 5 merges a gap of 2, the
++        others 5, so the tail (depth 4) is spared although it is LRU-oldest."""
++        component, nodes, core = _build_chain([4, 1, 1, 4])
++
++        _, freed = _evict_one(component)
++
++        self.assertEqual(freed, [2])
++        self.assertIsNotNone(nodes[0].component_data[MAMBA].value)
++        self.assertEqual(core.cascaded, [nodes[1]])
++
++    def test_locked_holder_is_a_boundary_not_a_victim(self):
++        component, nodes, core = _build_chain([4, 1, 1, 4])
++        nodes[1].component_data[MAMBA].lock_ref = 1
++
++        _, freed = _evict_one(component)
++
++        # With depth 5 pinned, depths 4 and 6 tie at a gap of 5; the tail wins.
++        self.assertEqual(freed, [1])
++        self.assertIsNotNone(nodes[1].component_data[MAMBA].value)
++
++    def test_session_referenced_holder_is_never_thinned(self):
++        component, nodes, core = _build_chain([4, 1, 1, 4])
++        nodes[1].component_data[MAMBA].session_ref = 1
++
++        _, freed = _evict_one(component)
++
++        self.assertEqual(freed, [1])
++        self.assertIsNotNone(nodes[1].component_data[MAMBA].value)
++
++    def test_fork_below_the_tail_ends_the_chain(self):
++        """A fork holder bounds the chain and keeps its own state; the tail is
++        the only candidate, so it is evicted as before."""
++        component, nodes, core = _build_chain([4, 1, 1, 4])
++        sibling = UnifiedTreeNode(core.tree_components)
++        sibling.parent = nodes[1]
++        sibling.key = RadixKey(token_ids=array("q", [99]))
++        nodes[1].children["fork"] = sibling
++
++        _, freed = _evict_one(component)
++
++        self.assertEqual(freed, [1])
++        self.assertIsNotNone(nodes[1].component_data[MAMBA].value)
++
++    def test_ancestor_holder_bounds_the_tail_gap(self):
++        """Depths 1, 2, 3 under a hot holder at depth 1: the tail at 2 has gap
++        3 - 1 = 2 and the node at 3 has gap 4 - 2 = 2, so the tie keeps the
++        shallow-first order; without the ancestor bound the tail's gap would
++        read 3 and the deeper node would be dropped instead."""
++        component, nodes, core = _build_chain([1, 1, 1, 1])
++        # Refresh the shallowest node so the LRU tail is the second one.
++        core.lru_lists[MAMBA].reset_node_mru(nodes[0])
++
++        _, freed = _evict_one(component)
++
++        self.assertEqual(freed, [2])
++
++    def test_device_leaf_at_the_tail_is_still_deleted_as_a_leaf(self):
++        component, nodes, core = _build_chain([1, 1])
++        core.evictable_device_leaves.add(nodes[1])
++        core.lru_lists[MAMBA].reset_node_mru(nodes[0])
++
++        node_id, freed = _evict_one(component)
++
++        self.assertEqual(node_id, nodes[1].id)
++        self.assertEqual(freed, [])
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.34.1
+

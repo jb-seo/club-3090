@@ -1,6 +1,6 @@
 # `sglang-v0518-scheduling-and-logging`
 
-Four patches applied to SGLang **inside the container** at startup by
+Nine patches applied to SGLang **inside the container** at startup by
 `install.sh`, which the compose runs before `launch_server`. Nothing to
 install on the host.
 
@@ -8,9 +8,9 @@ Base is **v0.5.18** (`71de97b264`). The compose pins `lmsysorg/sglang:v0.5.18`
 for that reason: `:latest` is already past it — as of 2026-09-04 `:latest` and
 `:v0.5.19` share a digest (`sha256:d6e72886...3eda9`).
 
-`bash install.sh --verify` reports which of the four are present, changing
-nothing. A container with all of `0001`–`0003` already applied can install
-`0004` alone by rerunning `install.sh`.
+`bash install.sh --verify` reports which of the nine are present, changing
+nothing. Rerunning `install.sh` upgrades a container with a complete prefix
+of three through eight patches by applying only the remaining patches.
 
 ## Why patches, not a fork checkout
 
@@ -33,9 +33,15 @@ tag when moving the pin — do not force them.
 | `0002-attention-backend-logging.patch` | Name the resolved attention backends at boot, and say why one was rejected. Auto-selection silently fell back to triton; nothing said which backend ran or on what grounds. |
 | `0003-decode-passes-per-prefill.patch` | `--decode-passes-per-prefill`, plus binding `--long-prefill-token-threshold` only when something else is waiting on the pass. |
 | `0004-autoround-w4a8.patch` | Experimental AutoRound dense W4A8 through the existing GPTQMarlin pipeline: per-token INT8 activations, original signed floating group scales, FP16/BF16 outputs. Includes the standalone JIT CUDA sources. |
+| `0005-add-dflash2-runtime-support.patch` | DFlash2 core: model registry entry, local convolution, candidate selector, V2 worker and config handling. Upstream `c14312a66420b75ca9a11bf1817c4db1fa26b097`. |
+| `0006-support-quantized-target-lm-head-for-dflash2.patch` | DFlash2 selector support for the target's existing quantized `lm_head`, including vocabulary padding and CUDA graph admission. Upstream `1cf2b8c54d81802abc15dcf23a29b9cc687bc01e`. |
+| `0007-mamba-alloc-req-slots-demand.patch` | Counts only the active and ping-pong Mamba slots the batch still needs, then evicts only the shortfall. |
+| `0008-mamba-coverage-thinning.patch` | Selects cold-path checkpoint victims by coverage while preserving v0.5.18's eviction loop. |
+| `0009-mamba-protect-reused-states.patch` | Marks reused Mamba states and excludes them from deeper thinning victims. |
 
-Scoped to `python/sglang/` — the upstream backport also carries test-suite
-changes the container has no use for.
+`0001`–`0004` are scoped to `python/sglang/`. `0005`/`0006` retain their
+upstream tests and original format-patch author/commit metadata. Their bytes
+are exactly `git format-patch -1 <upstream-sha> --stdout`; no adaptations.
 
 Two further fork-local commits are deliberately NOT here: a Triton
 kernel-load log line, and a mamba radix `evictable`/`available` counter in the
@@ -110,6 +116,155 @@ settled first:
 `0004` is a local experiment with a source-level switch, not a general
 quantization configuration or an upstream proposal.
 
+## Mamba cache backports (`0007`–`0009`)
+
+These are the three local cherry-picks of upstream PRs #38151 and #38000,
+authored by alphabetc1. Source commits, status and removal conditions are in
+[`docs/UPSTREAM.md`](../../../../../../docs/UPSTREAM.md#sglang-sgl-projectsglang).
+Each patch retains the author and commit metadata from its local
+`git format-patch` export: `fc84595d72`, `bc8d756a54`, `a50d98ad91`.
+
+The #38000 backport keeps the release's `while` eviction loop: when a deeper
+checkpoint is thinned, it continues until the requested number of slots is
+freed or a device leaf is returned to the driver. The upstream Rust radix-tree
+changes and integration tests are omitted because v0.5.18 has no such backend.
+Both PRs' Python unit tests are included.
+
+Local validation (2026-09-11): the installer regression suite passes 11 tests,
+including fresh v0.5.18 installation, upgrades from three through eight
+patches, repeated installation, read-only verification and rejection of
+partial, modified or out-of-order patches without changing installed files.
+The Python source passes syntax checks. Runtime unit tests in the host SGLang
+checkout could not collect because its PyTorch lacks
+`torch.cuda.memory._cuda_beginAllocateCurrentThreadToPool`; GPU serving and
+throughput have not been validated for these backports.
+
+## DFlash2 backports (`0005` / `0006`)
+
+Upstream sources, commit SHAs and drop conditions are tracked in
+[`docs/UPSTREAM.md`](../../../../../../docs/UPSTREAM.md#sglang-sgl-projectsglang).
+Authors: Zihan Zhang, Jian Chen and Liangsheng Yin (`0005`); Jimmy Shong and
+LING ZHI (`0006`), with the original coauthor trailers retained in each patch.
+
+Base: SGLang `v0.5.18`, commit
+`71de97b264b04dcd514cf904003028aefe9775c8`, followed by the existing four
+patches. This release already has `DFlashWorkerV2`, `DFlashDraftInputV2`,
+ReplaySSM plumbing, nested `dflash_config` parsing and explicit draft
+`unquant` handling. Those are prerequisites, not missing files to replace.
+The release also has the newer `reserved_seq_lens_*` naming in the V2 worker;
+both upstream patches apply cleanly and preserve that release fix.
+
+`0005` modifies:
+
+- `python/sglang/kernels/ops/speculative/dflash.py`: convolution kernel.
+- `python/sglang/srt/models/dflash.py`: `DFlash2DraftModel` in `EntryClass`,
+  grouped local convolution, candidate selector and token-path walk.
+- `python/sglang/srt/speculative/dflash_utils.py`: convolution/selector config.
+- `python/sglang/srt/speculative/dflash_worker_v2.py`: selector proposal,
+  greedy/sampled verification and CUDA graph integration.
+- `python/sglang/srt/model_executor/model_runner_components/spec_aux_hidden_state.py`:
+  Muse-specific layer mapping; Qwen layer IDs stay unchanged.
+- `test/registered/unit/spec/test_dflash_logits.py` and
+  `test/registered/unit/model_executor/model_runner_components/test_spec_aux_hidden_state.py`.
+
+`0006` modifies only `models/dflash.py`, `speculative/dflash_worker_v2.py`
+(under `python/sglang/srt/`) and `test_dflash_logits.py`. It calls the existing
+`lm_head.quant_method.apply`, masks padded vocabulary rows with `-inf`, gathers
+TP vocabulary candidates, and admits supported quantized heads for graph
+capture. It does not change AutoRound config, Marlin dispatch, INT8 activation
+quantization, or any EAGLE implementation. The BF16 draft still needs explicit
+`--speculative-draft-model-quantization=unquant`: omission inherits target
+quantization in this base release.
+
+The official `z-lab/Qwen3.8-27B-DFlash2` config fetched on 2026-09-09 declares
+`dflash_config.target_layer_ids=[5,19,33,47,61]`, `block_size=8`,
+`conv_kernel_size=2`, `conv_group_size=16`, `selector_rank=256`, and
+`selector_top_k=16`. These explicit IDs take precedence over the layer-spacing
+fallback `[1,16,31,46,61]`. Block size 8 means seven proposed draft tokens and
+one anchor per verification block. Both overlap and synchronous DFLASH use
+the V2 worker; no `SGLANG_ENABLE_SPEC_V2` environment variable is needed.
+
+### Local validation (2026-09-09)
+
+- Original `0001`–`0004` patch bytes and existing W4A8 edits unchanged.
+- `0005`/`0006` byte-identical to upstream `git format-patch` output; no adaptation.
+- Clean v0.5.18 install, upgrades from 3/4/5 patches, repeated install and
+  `--verify`, rejection of partial/modified patches without mutation: 7 tests pass.
+- Actual registry resolution, imports of both V2 workers/info, official config
+  as a dictionary and Transformers config, and explicit draft-unquant handling pass.
+- `python3 -m compileall -q python/sglang` passes on the complete patched tree.
+- Upstream DFlash2/quantized-head/layer-mapping unit tests: 12 pass on CPU.
+
+This workstation has one RTX 4060 8GB and no target weights; its test container
+also reports CUDA initialization error 500. **No GPU kernel, full draft load,
+3090 TP2 acceptance, throughput or end-to-end EAGLE claim is made here.**
+The user will run those checks on the serving rig; remote access is unavailable.
+
+Reproduce installer and upstream tests (the latter need the SGLang environment
+and pytest):
+
+```bash
+python3 /patches/test_install.py /path/to/sglang-git-checkout
+cd /sgl-workspace/sglang
+python3 -m pytest -q test/registered/unit/spec/test_dflash_logits.py \
+  test/registered/unit/model_executor/model_runner_components/test_spec_aux_hidden_state.py
+bash /patches/install.sh --verify
+```
+
+### Serving-rig validation: preserve EAGLE, then test DFLASH
+
+The shipped `mtp.yml` stays on its existing EAGLE configuration. Its existing
+mount and `bash /patches/install.sh` command automatically install all nine
+patches in order at startup; no Docker build or image change is required.
+Copy this entire patch directory to the serving checkout, then recreate the
+existing service using the same environment/model/cache paths.
+
+1. Run the EAGLE smoke below and the existing club benchmark first. Record
+   target `[Marlin] W4A8 prepared: ... activation_dtype=int8` logs and peak VRAM
+   per card. The user-reported comparison points are about 1700–1750 short
+   prefill tok/s and 92/117 narrative/code decode tok/s, not locally remeasured.
+2. For DFLASH, copy the existing compose beside `mtp.yml` as a temporary
+   untracked file. Add a read-only volume for the downloaded official BF16
+   `z-lab/Qwen3.8-27B-DFlash2` directory at `/models/draft`. Replace the four
+   EAGLE argument entries with exactly:
+
+   ```yaml
+   - --speculative-algorithm=DFLASH
+   - --speculative-draft-model-path=/models/draft
+   - --speculative-draft-model-quantization=unquant
+   - --speculative-dflash-block-size=8
+   ```
+
+   Remove the old `--speculative-num-draft-tokens=4`; it conflicts with block
+   size 8. Keep ReplaySSM, TP2, AutoRound, dtype, FP8 KV, FlashInfer, page size,
+   scheduling and memory settings as in the working compose. Recreate the
+   same service with the temporary compose after stopping its EAGLE instance.
+   Do not enable any `SGLANG_SIMULATE_ACC_*` benchmark controls.
+3. Check boot logs for `model=DFlash2DraftModel`, `block_size=8`, capture layers
+   `[5,19,33,47,61]`, and the W4A8 preparation logs. Run the DFLASH smoke below.
+   Review the actual generated Python function, in addition to its counters.
+4. Return to the original `mtp.yml` and repeat the EAGLE smoke/benchmark.
+
+Run inside the appropriate already-started container (default name shown):
+
+```bash
+docker exec sglang-qwen38-27b-mtp-dual python3 /patches/smoke_spec.py \
+  --algorithm EAGLE --output /tmp/eagle-smoke.json
+# After starting the temporary DFLASH configuration:
+docker exec sglang-qwen38-27b-mtp-dual python3 /patches/smoke_spec.py \
+  --algorithm DFLASH --output /tmp/dflash2-smoke.json
+docker cp sglang-qwen38-27b-mtp-dual:/tmp/dflash2-smoke.json ./dflash2-smoke.json
+```
+
+Copy each result out before recreating its container. The smoke sends one
+thinking-OFF, temperature-zero request using the target tokenizer's template.
+It saves output and metadata even if acceptance is zero, and requires
+`spec_verify_ct > 0`, `spec_num_correct_drafts > 0`, and `spec_accept_rate > 0`.
+`spec_accept_length > 0` alone is insufficient because it includes bonus tokens.
+When accepted-draft count is zero, inspect config/layer IDs, tokenizer alignment,
+convolution/selector loading, quantized head and ReplaySSM logs in that order.
+No performance tuning is included in these patches.
+
 ## Verifying at runtime
 
 Boot should print, per rank and per model runner (target and MTP draft):
@@ -147,7 +302,11 @@ in the log.
   version mismatch.
 - **A partially patched tree** — an incomplete `0001`–`0003` stack is refused
   rather than reapplied. A complete old stack can upgrade to `0004`; a partial
-  or modified `0004` fails its full-patch check. Recreate the container if the
+  or modified `0004` fails its full-patch check. Complete `0001`–`0004` and
+  `0001`–`0005` stacks can upgrade to all six. `0006` is reversed in a temporary
+  copy before checking `0005`, so shared context does not cause reapplication.
+  All pending patches are preflighted in a temporary copy before installation;
+  partial/modified DFlash or Mamba files are refused. Recreate the container if the
   installed files no longer match the patches.
 - **`--decode-passes-per-prefill` on an unpatched engine** — rejected at parse
   time. Harmless.

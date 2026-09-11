@@ -2,6 +2,33 @@
 
 Dated history for Qwen3.8-27B configs in this repo. Append-only — add a new entry, don't rewrite past ones.
 
+## 2026-09-11 — SGLang v0.5.18 Mamba cache backports
+
+Append alphabetc1's Mamba allocation-demand and coverage-thinning fixes as
+`0007`–`0009` after the existing six SGLang patches. The backport preserves
+the release's Python eviction loop and omits the absent Rust radix-tree
+backend. Upstream sources and removal conditions are tracked in
+[`docs/UPSTREAM.md`](../../docs/UPSTREAM.md#sglang-sgl-projectsglang).
+
+The installer supports upgrades from three through eight patches and checks
+overlapping patches in a temporary copy before changing installed files.
+All 11 installer tests pass; host runtime unit tests are blocked at collection
+by a PyTorch CUDA API mismatch. GPU serving and performance remain unmeasured.
+
+## 2026-09-09 — SGLang v0.5.18 DFlash2 backports
+
+Append upstream DFlash2 core (`0005`) and quantized target `lm_head` support
+(`0006`) to the existing SGLang patch series, retaining upstream authors and
+diffs. Existing `0001`–`0004`, AutoRound W4A8 code and the EAGLE compose are
+unchanged. The installer supports upgrades and checks the overlapping DFlash
+patches in reverse order in a temporary copy. Sources and removal conditions:
+[`docs/UPSTREAM.md`](../../docs/UPSTREAM.md#sglang-sgl-projectsglang).
+
+Local syntax, model-registry/config and unit checks pass; full 3090 TP2 model
+load, nonzero DFlash2 acceptance, W4A8 throughput and EAGLE serving regression
+remain for on-rig validation. The patch README includes the procedure and a
+deterministic smoke script that checks strict accepted-draft counters.
+
 ## 2026-09-02 — dual-max: `ASYNC_SCHED=off` wired — vllm#50021 mitigation (1), drafter kept at ~0% cost
 
 The `dual/fp8/mtp.yml` header has documented two mitigations for the [vllm#50021](https://github.com/vllm-project/vllm/pull/50021) MTP × hybrid-GDN wild write since the 2026-08-19 production crash (#1059): (1) `ASYNC_SCHED=off` → `--no-async-scheduling`, which keeps the drafter, and (2) `SPEC=off`, which drops it. Only (2) was actually plumbed — `ASYNC_SCHED` was header prose with no env passthrough and no entrypoint branch, so anyone following the header got the drafter-off path by default and paid for it in decode. This wires (1) the same way `SPEC` is wired: env passthrough + entrypoint `case`, off by default, appended to both `exec vllm serve` branches.

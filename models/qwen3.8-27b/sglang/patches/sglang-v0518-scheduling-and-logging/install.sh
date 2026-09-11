@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply the six vendored patches to SGLang inside the container.
+# Apply the nine vendored patches to SGLang inside the container.
 #
 # Run from the compose's command, before launch_server. Idempotent: a restart
 # re-runs it and detects the already-applied state instead of failing.
@@ -22,6 +22,9 @@ PATCHES=(
   "0004-autoround-w4a8.patch"
   "0005-add-dflash2-runtime-support.patch"
   "0006-support-quantized-target-lm-head-for-dflash2.patch"
+  "0007-mamba-alloc-req-slots-demand.patch"
+  "0008-mamba-coverage-thinning.patch"
+  "0009-mamba-protect-reused-states.patch"
 )
 
 # Markers for 0001..0003, chosen to survive later patches: these touch
@@ -43,8 +46,8 @@ marker_0004() {
   git -C "$SGLANG_DIR" apply --reverse --check "$HERE/${PATCHES[3]}" >/dev/null 2>&1
 }
 
-# 0006 rewrites 0005's context. Reverse the suffix in a private copy, then
-# check all of 0005 (including added files), never just a class-name marker.
+# Later patches rewrite earlier context. Reverse the installed suffix in a
+# private copy and validate the full series, including added test files.
 snapshot_files() {
   local dest="$1" path
   shift
@@ -56,28 +59,39 @@ snapshot_files() {
   done < <(git apply --numstat "$@" | cut -f3 | sort -u)
 }
 
-detect_dflash_state() (
-  local scratch
+detect_suffix_state() (
+  local scratch count i valid
+  local suffix=("${PATCHES[@]:4}")
   scratch="$(mktemp -d)"
   trap 'rm -rf "$scratch"' EXIT
-  snapshot_files "$scratch" "$HERE/${PATCHES[4]}" "$HERE/${PATCHES[5]}"
-  cd "$scratch"
-  if git apply --reverse --check "$HERE/${PATCHES[5]}" >/dev/null 2>&1; then
-    git apply --reverse "$HERE/${PATCHES[5]}"
-    git apply --reverse --check "$HERE/${PATCHES[4]}" >/dev/null 2>&1 || exit 1
-    echo 2
-  elif git apply --reverse --check "$HERE/${PATCHES[4]}" >/dev/null 2>&1; then
-    echo 1
-  else
-    # A clean missing suffix must also be applicable in full. This rejects
-    # modified/partial DFlash patches before touching the real source tree.
-    git apply "$HERE/${PATCHES[4]}" >/dev/null 2>&1 || exit 1
-    git apply --check "$HERE/${PATCHES[5]}" >/dev/null 2>&1 || exit 1
-    echo 0
-  fi
+  local paths=()
+  for name in "${suffix[@]}"; do paths+=("$HERE/$name"); done
+  mkdir "$scratch/snapshot"
+  snapshot_files "$scratch/snapshot" "${paths[@]}"
+  for ((count=${#suffix[@]}; count>=0; count--)); do
+    cp -a "$scratch/snapshot" "$scratch/candidate-$count"
+    valid=1
+    for ((i=count-1; i>=0; i--)); do
+      git -C "$scratch/candidate-$count" apply --reverse "${paths[$i]}" >/dev/null 2>&1 || { valid=0; break; }
+    done
+    [ "$valid" -eq 1 ] || continue
+    # Reapply everything from the recovered base to reject missing, modified
+    # or out-of-order patches before touching the installed source tree.
+    for name in "${paths[@]}"; do
+      git -C "$scratch/candidate-$count" apply "$name" >/dev/null 2>&1 || { valid=0; break; }
+    done
+    if [ "$valid" -eq 1 ]; then
+      echo "$count"
+      exit 0
+    fi
+  done
+  exit 1
 )
-marker_0005() { [ "$dflash_state" -ge 1 ]; }
-marker_0006() { [ "$dflash_state" -eq 2 ]; }
+marker_0005() { [ "$suffix_state" -ge 1 ]; }
+marker_0006() { [ "$suffix_state" -ge 2 ]; }
+marker_0007() { [ "$suffix_state" -ge 3 ]; }
+marker_0008() { [ "$suffix_state" -ge 4 ]; }
+marker_0009() { [ "$suffix_state" -eq 5 ]; }
 
 state() {
   local n=0
@@ -87,31 +101,34 @@ state() {
   marker_0004 && n=$((n + 1))
   marker_0005 && n=$((n + 1))
   marker_0006 && n=$((n + 1))
+  marker_0007 && n=$((n + 1))
+  marker_0008 && n=$((n + 1))
+  marker_0009 && n=$((n + 1))
   echo "$n"
 }
 
 [ -d "$SGLANG_DIR/python/sglang" ] || {
   echo "[club-3090] no SGLang source at $SGLANG_DIR" >&2; exit 1; }
 
-if ! dflash_state="$(detect_dflash_state)"; then
-  echo "[club-3090] DFlash suffix is partial, modified, or DOES NOT APPLY; expected v0.5.18." >&2
+if ! suffix_state="$(detect_suffix_state)"; then
+  echo "[club-3090] DFlash/Mamba suffix is partial, modified, or DOES NOT APPLY; expected v0.5.18." >&2
   echo "[club-3090] recreate the container to get a clean image tree." >&2
   exit 1
 fi
 
 if [ "${1:-}" = "--verify" ]; then
-  for m in 1 2 3 4 5 6; do
+  for m in 1 2 3 4 5 6 7 8 9; do
     printf '%-45s ' "${PATCHES[$((m - 1))]}"
     "marker_000$m" && echo "applied" || echo "NOT applied"
   done
-  [ "$(state)" = "6" ] || { echo "incomplete"; exit 1; }
-  echo "all six applied"
+  [ "$(state)" = "9" ] || { echo "incomplete"; exit 1; }
+  echo "all nine applied"
   exit 0
 fi
 
 start_index=0
 case "$(state)" in
-  6)
+  9)
     echo "[club-3090] patches already applied — nothing to do"
     exit 0
     ;;
@@ -121,9 +138,9 @@ case "$(state)" in
     if marker_0001 && marker_0002 && marker_0003; then
       start_index=3
       if marker_0004; then
-        start_index=$((4 + dflash_state))
-      elif [ "$dflash_state" -ne 0 ]; then
-        echo "[club-3090] DFlash installed without intact 0004 — refusing." >&2
+        start_index=$((4 + suffix_state))
+      elif [ "$suffix_state" -ne 0 ]; then
+        echo "[club-3090] DFlash/Mamba installed without intact 0004 — refusing." >&2
         exit 1
       fi
     else
@@ -137,7 +154,7 @@ case "$(state)" in
 esac
 
 # Preflight every remaining patch in order before mutating any installed file.
-# In particular, a bad 0006 must not leave an old working stack at 0005.
+# A bad later patch must not leave an old working stack partially upgraded.
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 pending=()
@@ -163,7 +180,7 @@ for name in "${PATCHES[@]:$start_index}"; do
   fi
 done
 
-dflash_state="$(detect_dflash_state)"
-[ "$(state)" = "6" ] || {
+suffix_state="$(detect_suffix_state)"
+[ "$(state)" = "9" ] || {
   echo "[club-3090] patches applied but a marker is missing" >&2; exit 1; }
-echo "[club-3090] patches OK — scheduling, logging, AutoRound W4A8 and DFlash2 installed"
+echo "[club-3090] patches OK — scheduling, logging, AutoRound W4A8, DFlash2 and Mamba cache fixes installed"
