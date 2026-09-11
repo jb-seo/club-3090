@@ -4,10 +4,65 @@ One compose: [`compose/dual/autoround-int4/mtp.yml`](compose/dual/autoround-int4
 Boots, serves, and is fast enough to use. It is **not** a production path yet,
 for reasons that are open questions rather than known defects — see below.
 
-Needs three vendored patches, applied in-container at startup:
+Needs nine vendored patches, applied in-container at startup:
 [`patches/sglang-v0518-scheduling-and-logging/`](patches/sglang-v0518-scheduling-and-logging/README.md).
 The image is pinned to `lmsysorg/sglang:v0.5.18` because that is what they
 are cut against — `:latest` is already `v0.5.19`.
+
+## Run inside an existing RunPod container
+
+Use `lmsysorg/sglang:v0.5.18` with a Bash entrypoint. The launcher clones
+this fork's `qwen3.8-27b-sglang-mtp` branch into `/workspace/club-3090`, applies
+the nine patches to the image's `/sgl-workspace/sglang` source and runs
+`python3 -m sglang.launch_server` in the foreground. It reads the arguments
+and environment from `compose/dual/autoround-int4/mtp.yml` so list-valued
+flags and future compose edits stay in sync.
+
+Once the launcher files have been pushed to that branch:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jb-seo/club-3090/qwen3.8-27b-sglang-mtp/models/qwen3.8-27b/sglang/scripts/run_in_runpot.sh | bash
+```
+
+The default model is the profile's AutoRound INT4 HF repository, currently
+`Frozenlock/Qwen3.8-27B-int4-AutoRound`; SGLang downloads missing files using
+`HF_HOME=/workspace/cache/huggingface`. An existing `/models/target/config.json`
+or `/workspace/models/qwen3.8-27b-autoround-int4/config.json` takes precedence.
+Set `MODEL_PATH` to use another local directory or HF model ID. JIT caches
+use `/workspace/cache/sglang`. Point `WORKSPACE_DIR` at your persistent volume
+if it is mounted elsewhere; existing `HF_HOME` and `SGLANG_CACHE_DIR` win.
+
+Defaults retain the compose's TP=2, PCIe communication settings, built-in
+EAGLE/MTP drafter and HTTP port **30000**. Expose that port in the Pod template;
+there is no Docker port mapping from 8042 inside this container. GPU access
+and the compose's 16 GiB shared-memory requirement belong to the container
+configuration. The script checks the installed SGLang version and visible
+GPU count before applying patches.
+
+```bash
+# Inspect the command first (no patch installation, weights or server).
+curl -fsSL https://raw.githubusercontent.com/jb-seo/club-3090/qwen3.8-27b-sglang-mtp/models/qwen3.8-27b/sglang/scripts/run_in_runpot.sh | bash -s -- --dry-run
+
+# Reuse the checkout with explicit model/port overrides and extra server flags.
+MODEL_PATH=/workspace/models/my-autoround-model PORT=8042 \
+  bash /workspace/club-3090/models/qwen3.8-27b/sglang/scripts/run_in_runpot.sh \
+  --max-running-requests=4
+```
+
+For a pipeline, export overrides first or use `| env PORT=8042 bash`;
+`PORT=8042 curl ... | bash` only sets the variable on curl. `TP_SIZE` can
+override TP explicitly. Extra SGLang arguments are appended to the compose
+arguments. `HF_TOKEN` is passed through without being printed.
+
+Reruns reuse the checkout and the idempotent patch installer. The launcher
+does not pull or reset an existing checkout: update it deliberately, or set
+`CLUB3090_DIR` to a new directory. `CLUB3090_REPO` and `CLUB3090_REF` select
+another clone source; `--help` lists the other settings.
+
+Validation: seven CPU-only launcher tests cover compose argument parity,
+overrides, model selection, version/GPU checks, piped clone/reuse and refusing
+to start after patch installation fails. No RunPod GPU model load or serving
+benchmark has been run for this launcher.
 
 ## How this was arrived at
 

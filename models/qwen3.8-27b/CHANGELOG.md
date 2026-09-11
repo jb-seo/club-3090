@@ -2,6 +2,14 @@
 
 Dated history for Qwen3.8-27B configs in this repo. Append-only — add a new entry, don't rewrite past ones.
 
+## 2026-09-11 — SGLang launcher for an existing RunPod container
+
+Add `sglang/scripts/run_in_runpot.sh` for piped startup inside the stock
+v0.5.18 image. It clones the recipe fork, reads the existing compose command,
+applies the nine patches, and launches SGLang with persistent model/JIT caches.
+Local model paths, TP, port and extra server arguments can be overridden.
+Seven CPU-only launcher tests pass; RunPod GPU serving remains unvalidated.
+
 ## 2026-09-11 — SGLang v0.5.18 Mamba cache backports
 
 Append alphabetc1's Mamba allocation-demand and coverage-thinning fixes as
