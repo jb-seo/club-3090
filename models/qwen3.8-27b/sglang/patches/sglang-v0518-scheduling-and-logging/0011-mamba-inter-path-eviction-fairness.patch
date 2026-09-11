@@ -1,0 +1,586 @@
+From: JeongBong Seo <lifeofthanks@gmail.com>
+Subject: [PATCH] Share Mamba eviction pressure across cold paths
+
+Keep the coverage-aware victim selector from 0008/0009 and put an
+LRU-ordered, eviction-local round policy above it. Each non-branching
+segment contributes one checkpoint per sweep while retaining two usable
+device checkpoints. Count checkpoints with the existing match validators;
+never refresh normal access recency to implement this second chance.
+
+Repeat fair sweeps while they make progress. When no above-floor path can
+contribute, restart at the true LRU tail and use the original hard-pressure
+policy, so the soft floor cannot strand reclaimable slots. Preserve leaf
+IO and session partition handling, and exclude load-back-pinned victims.
+
+The exact-demand allocation backport and its v0.5.18 correction in 0010
+are unchanged. The separate insertion-time maximum-state cap is unchanged;
+a cap of two can leave every path already at this policy's soft floor.
+
+---
+diff --git a/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py b/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py
+index 01ea98b972..996856882f 100644
+--- a/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py
++++ b/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py
+@@ -59,6 +59,10 @@ if TYPE_CHECKING:
+ # node's mamba state, so coverage thinning must never pick it.
+ MAMBA_REUSED_KEY = "mamba_reused"
+ 
++# Eviction-local policy; neither quota nor floor refreshes access recency.
++MAX_THIN_PER_PATH_PER_ROUND = 1
++MIN_RETAINED_MAMBA_STATES_PER_PATH = 2
++
+ 
+ class MambaComponent(TreeComponent):
+     component_type = ComponentType.MAMBA
+@@ -368,8 +372,15 @@ class MambaComponent(TreeComponent):
+         return freed, host_freed
+ 
+     def _evict_device_start(self, request_cnt: int) -> None:
+-        """Begin the device-eviction walk from this component's LRU cursor."""
++        """Begin fair LRU sweeps; all bookkeeping dies with this eviction."""
+         self._evict_device_request_cnt = request_cnt
++        self._evict_hard_pressure = False
++        self._evict_round_start_freed: Optional[int] = None
++        self._evict_path_counts: dict[NodeId, int] = {}
++        self._evict_paths: dict[NodeId, tuple[NodeId, int]] = {}
++        self._restart_device_eviction_cursor()
++
++    def _restart_device_eviction_cursor(self) -> None:
+         if self.tree_core.enable_session_radix_cache:
+             lru = self.tree_core.lru_lists[self.component_type]
+             lru.cursor_begin()
+@@ -379,49 +390,139 @@ class MambaComponent(TreeComponent):
+                 self.component_type
+             ].get_lru_no_lock()
+ 
++    def _advance_device_eviction_cursor(self, node: UnifiedTreeNode) -> None:
++        lru = self.tree_core.lru_lists[self.component_type]
++        self._evict_device_cursor = (
++            lru.cursor_next()
++            if self.tree_core.enable_session_radix_cache
++            else lru.get_prev_no_lock(node)
++        )
++
++    def _device_eviction_path(self, node: UnifiedTreeNode) -> tuple[NodeId, int]:
++        """Identify a non-branching segment and its ready device checkpoints.
++
++        A fork ends its incoming segment; each child starts a different one.
++        This does not require sessions to be registered. Shared ancestors do
++        not inflate every child's private checkpoint budget. Cache the result
++        for this sweep only: one victim per path means no recount is needed
++        until the next sweep. Already discovered segments remain separate if
++        deleting a leaf collapses a fork during the driver's IO step.
++        """
++        known = self._evict_paths.get(node.id)
++        if known is not None:
++            return known
++        root = self.tree_core.root_node
++        start = node
++        while (
++            start.parent is not root
++            and len(start.parent.children) == 1
++            and start.parent.id not in self._evict_paths
++        ):
++            start = start.parent
++        path = [start]
++        while len(path[-1].children) == 1:
++            child = next(iter(path[-1].children.values()))
++            if child.id in self._evict_paths:
++                break
++            path.append(child)
++
++        ancestors = []
++        parent = start.parent
++        while parent is not root:
++            ancestors.append(parent)
++            parent = parent.parent
++        # Reuse the real match validators, including SWA's stateful window.
++        # Host-only states and in-flight load-backs do not satisfy this device
++        # floor; neither do execution buffers, which are not tree values.
++        validators = [
++            comp.create_match_validator(match_device_only=True)
++            for comp in self.tree_core.components
++        ]
++        ready_prefix = True
++        retained = 0
++        for index, current in enumerate([*reversed(ancestors), *path]):
++            ready_prefix = (
++                ready_prefix
++                and current.component_data[ComponentType.FULL].value is not None
++                and current.load_back_pending_id is None
++            )
++            # Do not short-circuit stateful validators on an invalid boundary.
++            valid = all([validate(current) for validate in validators])
++            if index >= len(ancestors) and ready_prefix and valid:
++                retained += 1
++        result = (start.id, retained)
++        for current in path:
++            self._evict_paths[current.id] = result
++        return result
++
+     def _evict_device_next_node(
+         self,
+         tracker: dict[ComponentType, int],
+         device_frees: dict[ComponentType, list[torch.Tensor]],
+         host_frees: dict[ComponentType, list[torch.Tensor]],
+     ) -> Optional[NodeId]:
+-        """Return the next device-leaf node for the driver to evict, or None.
+-        Internal nodes are tombstoned inline (no IO). If the previous node's
+-        eviction removed the cursor, the walk resumes from the partition
+-        sentinel with session refs on, else it restarts at the LRU tail."""
++        """Spread Mamba loss across paths before falling back to hard LRU.
++
++        Each LRU sweep takes at most one victim per segment above its floor.
++        A sweep with no progress restarts at the true LRU tail in hard mode,
++        preserving the original coverage-aware policy without the soft floor.
++        Leaf IO remains with the driver; its tracker updates carry across calls.
++        """
+         ct = self.component_type
+         lru = self.tree_core.lru_lists[ct]
+         enabled = self.tree_core.enable_session_radix_cache
+-        if self._evict_device_cursor is not None and not lru.in_list(
+-            self._evict_device_cursor
+-        ):
+-            self._evict_device_cursor = (
+-                lru.cursor_next() if enabled else lru.get_lru_no_lock()
+-            )
+-        while (
+-            tracker[ct] < self._evict_device_request_cnt
+-            and self._evict_device_cursor is not None
+-            and lru.in_list(self._evict_device_cursor)
+-        ):
++        if self._evict_round_start_freed is None:
++            self._evict_round_start_freed = tracker[ct]
++        while tracker[ct] < self._evict_device_request_cnt:
++            # A deeper victim or the driver's leaf eviction can remove the
++            # saved next node. Resume safely without refreshing any real node.
++            if self._evict_device_cursor is not None and not lru.in_list(
++                self._evict_device_cursor
++            ):
++                self._evict_device_cursor = (
++                    lru.cursor_next() if enabled else lru.get_lru_no_lock()
++                )
++            if self._evict_device_cursor is None:
++                if self._evict_hard_pressure:
++                    return None
++                self._evict_hard_pressure = tracker[ct] == self._evict_round_start_freed
++                self._evict_round_start_freed = tracker[ct]
++                self._evict_path_counts.clear()
++                self._evict_paths.clear()
++                self._restart_device_eviction_cursor()
++                continue
+             x = self._evict_device_cursor
+             assert x.component_data[ct].value is not None
++            if x.load_back_pending_id is not None:
++                self._advance_device_eviction_cursor(x)
++                continue
++            if not self._evict_hard_pressure:
++                path_id, retained = self._device_eviction_path(x)
++                if (
++                    retained <= MIN_RETAINED_MAMBA_STATES_PER_PATH
++                    or self._evict_path_counts.get(path_id, 0)
++                    >= MAX_THIN_PER_PATH_PER_ROUND
++                ):
++                    self._advance_device_eviction_cursor(x)
++                    continue
++                self._evict_path_counts[path_id] = (
++                    self._evict_path_counts.get(path_id, 0) + 1
++                )
+             if x in self.tree_core.evictable_device_leaves and (
+                 not enabled or self._can_evict_leaf_atomically(x)
+             ):
+-                self._evict_device_cursor = (
+-                    lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
+-                )
++                self._advance_device_eviction_cursor(x)
+                 return x.id
+             victim = self._thinning_victim(x)
++            if not self._evict_hard_pressure:
++                self._advance_device_eviction_cursor(x)
+             if victim is not x:
+-                # Keep the cursor on x and re-evaluate its chain until enough
+-                # slots are freed or a device leaf is returned to the driver.
++                # Hard pressure keeps x as the cold anchor, as in #38000.
+                 self._tombstone_device_state(victim, tracker, device_frees, host_frees)
+                 continue
+-            if not enabled:
+-                x_next = lru.get_prev_no_lock(x)
++            if self._evict_hard_pressure:
++                self._advance_device_eviction_cursor(x)
+             self._tombstone_device_state(x, tracker, device_frees, host_frees)
+-            self._evict_device_cursor = lru.cursor_next() if enabled else x_next
+         return None
+ 
+     def _tombstone_device_state(
+@@ -492,6 +593,7 @@ class MambaComponent(TreeComponent):
+                 or cd.lock_ref > 0
+                 or cd.session_ref > 0
+                 or cd.metadata.get(MAMBA_REUSED_KEY)
++                or node.load_back_pending_id is not None
+             ):
+                 continue
+             lo = holders[i - 1][0] if i > 0 else prev_depth
+@@ -506,6 +608,9 @@ class MambaComponent(TreeComponent):
+         if self.tree_core.enable_session_radix_cache:
+             self.tree_core.lru_lists[self.component_type].cursor_end()
+         self._evict_device_cursor = None
++        self._evict_paths.clear()
++        self._evict_path_counts.clear()
++        self._evict_round_start_freed = None
+ 
+     def acquire_component_lock(
+         self,
+diff --git a/test/registered/unit/mem_cache/test_mamba_eviction_thinning.py b/test/registered/unit/mem_cache/test_mamba_eviction_thinning.py
+index 2526fe0c71..69afe2d20f 100644
+--- a/test/registered/unit/mem_cache/test_mamba_eviction_thinning.py
++++ b/test/registered/unit/mem_cache/test_mamba_eviction_thinning.py
+@@ -11,6 +11,7 @@ from collections import defaultdict
+ import torch
+ 
+ from sglang.srt.mem_cache.radix_cache import RadixKey
++from sglang.srt.mem_cache.unified_cache.components.full_component import FullComponent
+ from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
+     MAMBA_REUSED_KEY,
+     MambaComponent,
+@@ -59,6 +60,7 @@ def _build_chain(key_lens):
+     core = _FakeTreeCore()
+     component = object.__new__(MambaComponent)
+     component.tree_core = core
++    core.components = (object.__new__(FullComponent), component)
+     nodes = []
+     parent = core.root_node
+     for index, key_len in enumerate(key_lens):
+diff --git a/test/registered/unit/mem_cache/test_mamba_eviction_fairness.py b/test/registered/unit/mem_cache/test_mamba_eviction_fairness.py
+new file mode 100644
+index 0000000000..a2072287b7
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_mamba_eviction_fairness.py
+@@ -0,0 +1,328 @@
++"""CPU-only Mamba fairness tests using the real tree and leaf-eviction driver."""
++
++import unittest
++from array import array
++from collections import defaultdict
++from types import SimpleNamespace
++
++import torch
++
++from sglang.srt.mem_cache.radix_cache import RadixKey
++from sglang.srt.mem_cache.unified_cache.components.full_component import FullComponent
++from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
++    MAMBA_REUSED_KEY,
++    MambaComponent,
++)
++from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent
++from sglang.srt.mem_cache.unified_cache.components.tree_component import (
++    ComponentType,
++    LRURefreshPhase,
++)
++from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=3, suite="base-a-test-cpu")
++
++FULL, MAMBA, SWA = ComponentType.FULL, ComponentType.MAMBA, ComponentType.SWA
++
++
++def _tree(*, sessions=False, swa=False):
++    components = {FULL: object.__new__(FullComponent)}
++    if swa:
++        components[SWA] = object.__new__(SWAComponent)
++        components[SWA].sliding_window_size = 2
++    components[MAMBA] = object.__new__(MambaComponent)
++    for component in components.values():
++        component.is_evict_device_ongoing = False
++        component.reset_session_state()
++    core = UnifiedTreeCore(
++        SimpleNamespace(
++            page_size=1,
++            is_eagle=False,
++            enable_session_radix_cache=sessions,
++            eviction_policy="lru",
++            token_to_kv_pool_allocator=None,
++            enable_kv_cache_events=False,
++        ),
++        components,
++    )
++    return core, components[MAMBA]
++
++
++def _append_path(core, lengths, parent=None):
++    parent = core.root_node if parent is None else parent
++    path = []
++    for length in lengths:
++        node = core._new_node()
++        node.parent = parent
++        node.key = RadixKey(array("q", [node.id] * length))
++        parent.children[node.key.child_key(core.page_size)] = node
++        for ct in core.component_types:
++            node.component_data[ct].value = torch.full(
++                (1 if ct is MAMBA else length,), node.id, dtype=torch.int64
++            )
++            core.component_evictable_size_[ct] += len(node.component_data[ct].value)
++            if ct is not FULL:
++                core.lru_lists[ct].insert_mru(node)
++        core._update_evictable_leaf_sets(parent)
++        core._update_evictable_leaf_sets(node)
++        path.append(node)
++        parent = node
++    return path
++
++
++def _live(path):
++    return [node for node in path if node.component_data[MAMBA].value is not None]
++
++
++def _lru(core):
++    lru = core.lru_lists[MAMBA]
++    nodes = []
++    node = lru.tail.lru_prev[lru._pt]
++    while node is not lru.head:
++        if lru.in_list(node):
++            nodes.append(node)
++        node = node.lru_prev[lru._pt]
++    return nodes
++
++
++def _evict(core, count, *, already_freed=0, fail_leaf=False):
++    tracker = defaultdict(int, {MAMBA: already_freed})
++    freed = []
++    leaf_calls = []
++
++    def consume(result):
++        for ct, delta in result.tracker.items():
++            tracker[ct] += delta
++        freed.extend(int(value.item()) for value in result.device_frees[MAMBA])
++        # The real cache frees these tensors, then drains the result containers.
++        result.device_frees.clear()
++        result.host_frees.clear()
++
++    core.evict_device_start(MAMBA, already_freed + count)
++    try:
++        for _ in range(1000):
++            result = core.evict_device_next_node(MAMBA, tracker)
++            consume(result)
++            if result.node_id is None:
++                return freed, leaf_calls
++            leaf_calls.append(result.node_id)
++            if not fail_leaf:
++                consume(core.evict_device_leaf(result.node_id, is_write_back=False))
++        raise AssertionError("eviction did not terminate")
++    finally:
++        core.evict_device_end(MAMBA)
++
++
++class TestMambaEvictionFairness(unittest.TestCase):
++    def test_four_paths_contribute_once_in_lru_order(self):
++        for sessions in (False, True):
++            with self.subTest(sessions=sessions):
++                core, component = _tree(sessions=sessions)
++                paths = [_append_path(core, [4, 1, 1, 4]) for _ in range(4)]
++                before = _lru(core)
++                times = {n.id: n.last_access_time for p in paths for n in p}
++                freed, leaves = _evict(core, 4)
++                # Preserve #38000's non-tail min-gap victim in EACH path.
++                self.assertEqual(freed, [path[1].id for path in paths])
++                self.assertEqual(leaves, [])
++                self.assertEqual([len(_live(p)) for p in paths], [3] * 4)
++                self.assertEqual(_lru(core), [n for n in before if n.id not in freed])
++                self.assertTrue(
++                    all(n.last_access_time == times[n.id] for p in paths for n in p)
++                )
++                self.assertTrue(
++                    all(
++                        MAMBA_REUSED_KEY not in n.component_data[MAMBA].metadata
++                        for p in paths
++                        for n in p
++                    )
++                )
++                self.assertEqual(component._evict_paths, {})
++                self.assertEqual(component._evict_path_counts, {})
++                if sessions:
++                    self.assertIsNone(core.lru_lists[MAMBA].cursor.lru_prev[MAMBA])
++
++    def test_multiple_sweeps_retain_two_states_on_every_path(self):
++        for sessions in (False, True):
++            with self.subTest(sessions=sessions):
++                core, _ = _tree(sessions=sessions)
++                paths = [_append_path(core, [1] * 6) for _ in range(4)]
++                owner = {n.id: i for i, p in enumerate(paths) for n in p}
++                freed, _ = _evict(core, 16)
++                self.assertEqual([owner[nid] for nid in freed], [0, 1, 2, 3] * 4)
++                self.assertEqual([len(_live(p)) for p in paths], [2] * 4)
++
++    def test_floor_defers_a_cold_path_until_other_path_reaches_floor(self):
++        core, _ = _tree()
++        cold = _append_path(core, [1, 1])
++        warm = _append_path(core, [1] * 5)
++        freed, _ = _evict(core, 3)
++        self.assertTrue(set(freed) <= {n.id for n in warm})
++        self.assertEqual([len(_live(p)) for p in (cold, warm)], [2, 2])
++
++    def test_surviving_checkpoints_provide_partial_prefix_matches(self):
++        core, _ = _tree()
++        paths = [_append_path(core, [1] * 6) for _ in range(4)]
++        _evict(core, 16)
++        for path in paths:
++            # Each path retains depths 4 and 6. A branch at depth 5 can
++            # resume at 4, instead of losing the entire cached prefix.
++            key = RadixKey(array("q", [node.id for node in path[:5]]))
++            _, best, best_device, device_len, full_len, _ = core._match_prefix_helper(
++                key
++            )
++            self.assertIs(best, path[3])
++            self.assertIs(best_device, path[3])
++            self.assertEqual((device_len, full_len), (4, 5))
++
++    def test_hard_pressure_sacrifices_true_coldest_path(self):
++        for sessions in (False, True):
++            with self.subTest(sessions=sessions):
++                core, _ = _tree(sessions=sessions)
++                paths = [_append_path(core, [1] * 3) for _ in range(2)]
++                owner = {n.id: i for i, p in enumerate(paths) for n in p}
++                freed, leaves = _evict(core, 4)
++                self.assertEqual([owner[nid] for nid in freed], [0, 1, 0, 0])
++                self.assertEqual(leaves, [paths[0][-1].id])
++                self.assertEqual([len(_live(p)) for p in paths], [0, 2])
++
++    def test_both_paths_initially_at_floor_use_hard_lru(self):
++        core, _ = _tree()
++        paths = [_append_path(core, [1, 1]) for _ in range(2)]
++        freed, _ = _evict(core, 2)
++        self.assertEqual(set(freed), {n.id for n in paths[0]})
++        self.assertEqual(len(_live(paths[1])), 2)
++
++    def test_new_episode_starts_at_real_lru_not_last_eviction(self):
++        core, component = _tree()
++        paths = [_append_path(core, [4, 1, 1, 4]) for _ in range(2)]
++        self.assertEqual(_evict(core, 1)[0], [paths[0][1].id])
++        expected = component._thinning_victim(paths[0][0])
++        self.assertEqual(_evict(core, 1)[0], [expected.id])
++
++    def test_leaf_callbacks_keep_quota_across_driver_calls(self):
++        core, _ = _tree(sessions=True)
++        paths = [_append_path(core, [1] * 4) for _ in range(2)]
++        lru = core.lru_lists[MAMBA]
++        # Make A's leaf the oldest node, while preserving B as the next path.
++        for n in paths[0][:-1] + paths[1]:
++            lru.reset_node_mru(n)
++        freed, leaves = _evict(core, 2, already_freed=7)
++        self.assertEqual(freed, [paths[0][-1].id, paths[1][0].id])
++        self.assertEqual(leaves, [paths[0][-1].id])
++
++    def test_floor_protects_leaf_holder_while_other_path_can_thin(self):
++        core, _ = _tree()
++        cold = _append_path(core, [1, 1])
++        warm = _append_path(core, [1] * 4)
++        for n in [cold[0], *warm]:
++            core.lru_lists[MAMBA].reset_node_mru(n)
++        freed, leaves = _evict(core, 1)
++        self.assertEqual(freed, [warm[0].id])
++        self.assertEqual(leaves, [])
++        self.assertEqual(len(_live(cold)), 2)
++
++    def test_protected_non_tail_victims_remain_protected(self):
++        for protection in ("locked", "session", "reused", "load-back"):
++            with self.subTest(protection=protection):
++                core, component = _tree(sessions=True)
++                paths = [_append_path(core, [4, 1, 1, 4]) for _ in range(2)]
++                pinned = paths[0][1]
++                cd = pinned.component_data[MAMBA]
++                if protection == "locked":
++                    cd.lock_ref = 1
++                elif protection == "session":
++                    cd.session_ref = 1
++                    component._refresh_session_partition(pinned)
++                elif protection == "reused":
++                    component.refresh_lru(
++                        LRURefreshPhase.MATCH_END, pinned, core.root_node
++                    )
++                else:
++                    pinned.load_back_pending_id = pinned.id
++                freed, _ = _evict(core, 2)
++                self.assertNotIn(pinned.id, freed)
++                self.assertIsNotNone(cd.value)
++                self.assertIn(paths[1][1].id, freed)
++
++    def test_load_back_pin_on_lru_tail_is_never_evicted(self):
++        core, _ = _tree()
++        path = _append_path(core, [1, 1])
++        path[0].load_back_pending_id = path[0].id
++        freed, _ = _evict(core, 10)
++        self.assertEqual(freed, [path[1].id])
++        self.assertIsNotNone(path[0].component_data[MAMBA].value)
++
++    def test_shared_fork_does_not_merge_sibling_path_budgets(self):
++        core, _ = _tree()
++        trunk = _append_path(core, [1])
++        paths = [_append_path(core, [4, 1, 1, 4], parent=trunk[0]) for _ in range(2)]
++        freed, _ = _evict(core, 2)
++        self.assertEqual(freed, [p[1].id for p in paths])
++        self.assertIsNotNone(trunk[0].component_data[MAMBA].value)
++
++    def test_host_only_or_tombstoned_states_do_not_satisfy_device_floor(self):
++        for host in (False, True):
++            with self.subTest(host=host):
++                core, _ = _tree()
++                cold = _append_path(core, [1] * 4)
++                warm = _append_path(core, [1] * 3)
++                for n in cold[:2]:
++                    cd = n.component_data[MAMBA]
++                    cd.host_value = cd.value if host else None
++                    cd.value = None
++                    core.lru_lists[MAMBA].remove_node(n)
++                    core.component_evictable_size_[MAMBA] -= 1
++                self.assertEqual(_evict(core, 1)[0], [warm[0].id])
++                self.assertEqual(len(_live(cold)), 2)
++
++    def test_invalid_full_prefix_does_not_inflate_retained_count(self):
++        core, component = _tree()
++        cold = _append_path(core, [1] * 4)
++        warm = _append_path(core, [1] * 3)
++        cold[0].component_data[FULL].value = None
++        component._evict_device_start(1)
++        try:
++            self.assertEqual(component._device_eviction_path(cold[-1])[1], 0)
++        finally:
++            component._evict_device_end()
++        self.assertEqual(_evict(core, 1)[0], [warm[0].id])
++
++    def test_swa_match_window_is_used_for_floor(self):
++        core, component = _tree(swa=True)
++        cold = _append_path(core, [1] * 4)
++        warm = _append_path(core, [1] * 3)
++        cold[1].component_data[SWA].value = None
++        component._evict_device_start(1)
++        try:
++            self.assertEqual(component._device_eviction_path(cold[0])[1], 2)
++        finally:
++            component._evict_device_end()
++        self.assertEqual(_evict(core, 1)[0], [warm[0].id])
++
++    def test_exhaustion_locked_states_and_failed_leaf_io_terminate(self):
++        for fail_leaf in (False, True):
++            with self.subTest(fail_leaf=fail_leaf):
++                core, _ = _tree(sessions=True)
++                path = _append_path(core, [1] * 4)
++                path[1].component_data[MAMBA].lock_ref = 1
++                freed, _ = _evict(core, 100, fail_leaf=fail_leaf)
++                self.assertNotIn(path[1].id, freed)
++                self.assertEqual(len(freed), 2 if fail_leaf else 3)
++        core, _ = _tree()
++        self.assertEqual(_evict(core, 10), ([], []))
++
++    def test_zero_demand_does_not_inspect_paths(self):
++        core, component = _tree()
++        _append_path(core, [1] * 4)
++        from unittest.mock import patch
++
++        with patch.object(
++            component, "_device_eviction_path", side_effect=AssertionError
++        ):
++            self.assertEqual(_evict(core, 0), ([], []))
++
++
++if __name__ == "__main__":
++    unittest.main()

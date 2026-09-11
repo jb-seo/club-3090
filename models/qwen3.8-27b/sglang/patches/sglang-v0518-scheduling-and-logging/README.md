@@ -1,6 +1,6 @@
 # `sglang-v0518-scheduling-and-logging`
 
-Ten patches applied to SGLang **inside the container** at startup by
+Eleven patches applied to SGLang **inside the container** at startup by
 `install.sh`, which the compose runs before `launch_server`. Nothing to
 install on the host.
 
@@ -8,9 +8,9 @@ Base is **v0.5.18** (`71de97b264`). The compose pins `lmsysorg/sglang:v0.5.18`
 for that reason: `:latest` is already past it — as of 2026-09-04 `:latest` and
 `:v0.5.19` share a digest (`sha256:d6e72886...3eda9`).
 
-`bash install.sh --verify` reports which of the ten are present, changing
+`bash install.sh --verify` reports which of the eleven are present, changing
 nothing. Rerunning `install.sh` upgrades a container with a complete prefix
-of three through nine patches by applying only the remaining patches.
+of three through ten patches by applying only the remaining patches.
 
 ## Why patches, not a fork checkout
 
@@ -39,6 +39,7 @@ tag when moving the pin — do not force them.
 | `0008-mamba-coverage-thinning.patch` | Selects cold-path checkpoint victims by coverage while preserving v0.5.18's eviction loop. |
 | `0009-mamba-protect-reused-states.patch` | Marks reused Mamba states and excludes them from deeper thinning victims. |
 | `0010-fix-mamba-demand-v0518-request-fields.patch` | Corrects `0007` to use v0.5.18's request-level Mamba fields; fixes the first-prefill `req.kv is None` crash. Includes regression tests using real `Req` objects. |
+| `0011-mamba-inter-path-eviction-fairness.patch` | Spreads Mamba eviction across cold paths, retaining two usable checkpoints per path while possible, with a hard-pressure LRU fallback. |
 
 `0001`–`0004` are scoped to `python/sglang/`. `0005`/`0006` retain their
 upstream tests and original format-patch author/commit metadata. Their bytes
@@ -169,6 +170,82 @@ checkout without pulling, so update it explicitly before rerunning:
 git -C /workspace/club-3090 pull --ff-only
 bash /workspace/club-3090/models/qwen3.8-27b/sglang/scripts/run_in_runpot.sh
 ```
+
+### Inter-path Mamba eviction fairness (`0011`, 2026-09-11)
+
+The coverage selector from `0008`/`0009` can repeatedly thin the same cold
+path in one allocation episode. `0011` adds eviction-local LRU sweeps above
+that selector. Each sweep removes at most **one checkpoint per path**, then
+gives other paths a turn. A path at **two usable device checkpoints** is
+skipped while another path can contribute above that floor. Additional
+sweeps repeat until demand is met. If a whole sweep makes no progress, the
+cursor returns to the true LRU tail and the original coverage policy may
+evict below the floor, including sacrificing the coldest path entirely.
+
+A path here is a maximal non-branching tree segment: a fork ends its incoming
+segment and each child starts a separate one. Shared ancestors are not
+counted repeatedly toward each child's floor. Counting uses the actual
+device match validators, including the SWA window, and requires a resident
+Full-KV prefix without pending load-backs. Host-only, tombstoned, pending or
+otherwise unusable checkpoints and request execution buffers do not count.
+Existing deeper-victim protections remain; load-back-pinned candidates are
+also skipped during hard pressure. The min-gap scoring and reused-state
+marking are unchanged.
+
+No timestamp or real-node LRU refresh is introduced. Path counts and visited
+nodes are bounded by the tree scanned during eviction, memoized per sweep,
+and discarded when eviction ends. Ordinary allocation does no path scan.
+Separate one-slot eviction episodes still begin at the true LRU tail; this
+is fairness within an episode, not persistent rotation across allocations.
+The floor applies to Mamba-driven eviction. Full-KV eviction and the existing
+insertion-time `--mamba-max-states-per-path` cap remain independent.
+
+**The current compose sets that insertion cap to 2**, equal to the new floor.
+If every candidate path already has only two checkpoints, hard-pressure
+fallback is expected. To exercise distributed thinning, use a cap above 2
+or disable insertion thinning with `--mamba-max-states-per-path=-1`. After
+publishing this recipe update, update the existing RunPod checkout and
+restart SGLang with the appended override:
+
+```bash
+git -C /workspace/club-3090 pull --ff-only
+bash /workspace/club-3090/models/qwen3.8-27b/sglang/scripts/run_in_runpot.sh \
+  --mamba-max-states-per-path=-1
+```
+
+Omitting the flag from the SGLang command also defaults to `-1`. Omitting
+extra launcher arguments does not remove the compose's existing `=2` flag.
+The separate `--max-mamba-cache-size=32` pool limit still applies.
+
+CPU simulation using the actual insertion-cap, eviction and prefix-match
+code: four independent paths A–D, coldest first, each initially checkpointed
+at 20K, 40K, 60K, 80K, 100K and 120K. Full KV is resident; there are no locks,
+shared branches or reused-state markers. With eight slots available for
+cached checkpoints after other uses of the pool:
+
+| Insertion cap | Checkpoints retained on each path | Resume point for a matching 90K prefix |
+|---|---|---|
+| `2` | 100K, 120K | 0K |
+| Omitted / `-1` | 80K, 120K | 80K |
+
+The cap removes shallow states during insertion; without it, pressure-driven
+min-gap thinning preserves wider coverage. With only four cache slots left,
+hard pressure empties A and B while C and D retain their two checkpoints.
+Episode boundaries also matter: from six states per path, requesting four
+slots in one eviction removes one from each path (5/5/5/5 remain); requesting
+one slot in each of four separate evictions removes four from A (2/6/6/6
+remain). This simulation measures cache policy, not GPU serving performance.
+
+The installer adds only `0011` to a ten-patch container. Existing patches
+`0001`–`0010` retain their bytes, including the exact-demand allocation fix.
+Validation: 17 new fairness tests cover multiple paths/sweeps, partial prefix
+matches, real leaf-driver callbacks, hard-pressure progress, locks, session
+references, reuse, forks, load-back pins and invalid checkpoint counting.
+Together with the existing thinning, allocation and path-cap tests, 39 pass
+and five GPU tests skip in the local v0.5.18 container. All 14 installer tests
+pass, including fresh installation, upgrades from three through ten patches,
+idempotence and rejection of drift. GPU serving, TP2 behavior under load and
+real-workload cache-hit distributions remain unmeasured for this policy.
 
 ## DFlash2 backports (`0005` / `0006`)
 

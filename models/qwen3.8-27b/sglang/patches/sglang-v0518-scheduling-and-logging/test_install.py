@@ -111,7 +111,7 @@ class InstallTests(unittest.TestCase):
         (self.tree / "test/registered/unit/mem_cache/test_mamba_alloc_req_slots_demand.py").unlink()
         self.assert_rejected_unchanged()
 
-    def test_nine_patch_upgrade_only_changes_demand_files(self):
+    def test_nine_patch_upgrade_installs_demand_fix_and_fairness(self):
         self.apply_prefix(9)
         before = self.hashes()
         result = self.install()
@@ -120,12 +120,32 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(
             {path for path in before if before[path] != after[path]},
             {"python/sglang/srt/mem_cache/allocation.py",
-             "test/registered/unit/mem_cache/test_mamba_alloc_req_slots_demand.py"},
+             "test/registered/unit/mem_cache/test_mamba_alloc_req_slots_demand.py",
+             "python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py",
+             "test/registered/unit/mem_cache/test_mamba_eviction_thinning.py"},
         )
+        self.assertEqual(set(after) - set(before), {
+            "test/registered/unit/mem_cache/test_mamba_eviction_fairness.py"})
         self.assertIn("0010-fix-mamba-demand-v0518-request-fields.patch", result.stdout)
         verified = self.install("--verify")
         self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
-        self.assertIn("all ten applied", verified.stdout)
+        self.assertIn("all eleven applied", verified.stdout)
+        self.assertEqual(self.install().returncode, 0)
+        self.assertEqual(after, self.hashes())
+
+    def test_ten_patch_upgrade_preserves_exact_demand_files(self):
+        self.apply_prefix(10)
+        before = self.hashes()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("0011-mamba-inter-path-eviction-fairness.patch", result.stdout)
+        after = self.hashes()
+        self.assertEqual(
+            {path for path in before if before[path] != after[path]},
+            {"python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py",
+             "test/registered/unit/mem_cache/test_mamba_eviction_thinning.py"},
+        )
+        self.assertEqual(self.install("--verify").returncode, 0)
         self.assertEqual(self.install().returncode, 0)
         self.assertEqual(after, self.hashes())
 

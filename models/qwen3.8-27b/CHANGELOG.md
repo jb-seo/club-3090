@@ -2,6 +2,24 @@
 
 Dated history for Qwen3.8-27B configs in this repo. Append-only — add a new entry, don't rewrite past ones.
 
+## 2026-09-11 — Share SGLang Mamba eviction pressure across paths
+
+Append local patch `0011`: each eviction sweep takes at most one checkpoint
+per non-branching path, using the existing coverage/min-gap selector. Retain
+two usable device checkpoints while other paths can contribute; when a full
+sweep cannot progress, return to the true LRU tail and allow eviction below
+the floor. Eviction does not refresh access recency. The exact-demand fix
+and original patches `0001`–`0010` are unchanged. Upstream ancestry remains
+tracked in [`docs/UPSTREAM.md`](../../docs/UPSTREAM.md#sglang-sgl-projectsglang).
+
+The current compose's insertion cap of two is independent of this floor;
+the patch README documents a launcher override to disable that cap for
+fairness experiments. Seventeen new fairness tests include real partial
+prefix matching and leaf eviction. Combined runtime checks: 39 passed, five
+GPU tests skipped. All 14 installer tests pass, including in-place upgrades
+from ten patches. GPU serving and workload cache-hit improvements have not
+been measured for this policy.
+
 ## 2026-09-11 — Fix the SGLang Mamba backport's request-layout mismatch
 
 The initial allocation-demand backport in `0007` used newer `req.kv` fields

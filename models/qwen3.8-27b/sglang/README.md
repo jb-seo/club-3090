@@ -4,7 +4,7 @@ One compose: [`compose/dual/autoround-int4/mtp.yml`](compose/dual/autoround-int4
 Boots, serves, and is fast enough to use. It is **not** a production path yet,
 for reasons that are open questions rather than known defects — see below.
 
-Needs ten vendored patches, applied in-container at startup:
+Needs eleven vendored patches, applied in-container at startup:
 [`patches/sglang-v0518-scheduling-and-logging/`](patches/sglang-v0518-scheduling-and-logging/README.md).
 The image is pinned to `lmsysorg/sglang:v0.5.18` because that is what they
 are cut against — `:latest` is already `v0.5.19`.
@@ -13,7 +13,7 @@ are cut against — `:latest` is already `v0.5.19`.
 
 Use `lmsysorg/sglang:v0.5.18` with a Bash entrypoint. The launcher clones
 this fork's `qwen3.8-27b-sglang-mtp` branch into `/workspace/club-3090`, applies
-the ten patches to the image's `/sgl-workspace/sglang` source and runs
+the eleven patches to the image's `/sgl-workspace/sglang` source and runs
 `python3 -m sglang.launch_server` in the foreground. It reads the arguments
 and environment from `compose/dual/autoround-int4/mtp.yml` so list-valued
 flags and future compose edits stay in sync.
@@ -58,6 +58,12 @@ Reruns reuse the checkout and the idempotent patch installer. The launcher
 does not pull or reset an existing checkout: update it deliberately, or set
 `CLUB3090_DIR` to a new directory. `CLUB3090_REPO` and `CLUB3090_REF` select
 another clone source; `--help` lists the other settings.
+
+Patch `0011` spreads Mamba checkpoint eviction across paths with a soft floor
+of two usable checkpoints. The compose's insertion cap is also two; append
+`--mamba-max-states-per-path=-1` (or a cap above two) to test distributed
+thinning before hard-pressure fallback. See the
+[policy and validation notes](patches/sglang-v0518-scheduling-and-logging/README.md#inter-path-mamba-eviction-fairness-0011-2026-09-11).
 
 Validation: seven CPU-only launcher tests cover compose argument parity,
 overrides, model selection, version/GPU checks, piped clone/reuse and refusing
