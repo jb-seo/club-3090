@@ -203,36 +203,24 @@ services:
       - --kv-cache-dtype=fp8_e4m3
       # --- speculative decoding (built-in MTP head, no external drafter) ----
       - --speculative-algorithm=EAGLE
-      - --speculative-num-steps=3
+      - --speculative-num-steps=2
       - --speculative-eagle-topk=1
-      - --speculative-num-draft-tokens=4
+      - --speculative-num-draft-tokens=3
       - --enable-linear-replayssm-spec
+      - --mamba-ssm-dtype=bfloat16
       # --- hybrid GDN state cache ------------------------------------------
       # extra_buffer requires page-size 64 (FLA chunk size). Both move together.
       - --mamba-radix-cache-strategy=extra_buffer
       - --page-size=64
-      - --max-mamba-cache-size=64
-      - --mamba-ssm-dtype=bfloat16
-      # --- scheduling (needs the patched fork) ------------------------------
-      - --chunked-prefill-size=4096
-      - --long-prefill-token-threshold=2048
-      - --decode-passes-per-prefill=50
+      - --max-mamba-cache-size=32
+      - --mamba-max-states-per-path=2
       # --- memory ----------------------------------------------------------
-      - --mem-fraction-static=0.90
-      - --max-running-requests=1
-      # nargs flag: the values must follow as separate words. `--flag=8` binds
-      # only the 8 and argparse then rejects the rest as unrecognised.
-      - --cuda-graph-bs-prefill
-      - "8"
-      - "16"
-      - "32"
-      - "64"
-      - "128"
-      - "256"
-      - "512"
-      - "1024"
-      - "2048"
-      - "4096"
+      - --chunked-prefill-size=8192
+      - --long-prefill-token-threshold=4048
+      - --decode-passes-per-prefill=50
+      - --mem-fraction-static=0.95
+      - --max-running-requests=4
+      - --disable-prefill-cuda-graph
       # --- multimodal ------------------------------------------------------
       # The fast (CUDA) image processor runs on GPU 0, alongside TP rank 0's
       # weights, and OOMs there while GPU 1 still has headroom -- the asymmetry
