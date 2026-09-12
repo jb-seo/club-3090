@@ -121,6 +121,10 @@ class InstallTests(unittest.TestCase):
             {path for path in before if before[path] != after[path]},
             {"python/sglang/srt/mem_cache/allocation.py",
              "python/sglang/srt/server_args.py",
+             "python/sglang/srt/managers/scheduler.py",
+             "python/sglang/srt/mem_cache/memory_pool.py",
+             "python/sglang/srt/mem_cache/unified_cache/components/full_component.py",
+             "python/sglang/srt/mem_cache/unified_radix_cache.py",
              "test/registered/unit/mem_cache/test_mamba_alloc_req_slots_demand.py",
              "python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py",
              "test/registered/unit/mem_cache/test_mamba_path_state_cap.py",
@@ -129,11 +133,13 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(set(after) - set(before), {
             "test/registered/unit/mem_cache/test_mamba_eviction_fairness.py",
             "test/registered/unit/mem_cache/test_mamba_path_cap_coverage.py",
-            "test/manual/mem_cache/benchmark_mamba_path_cap.py"})
+            "test/manual/mem_cache/benchmark_mamba_path_cap.py",
+            "python/sglang/srt/mem_cache/unified_cache/history.py",
+            "test/registered/unit/mem_cache/test_cache_history.py"})
         self.assertIn("0010-fix-mamba-demand-v0518-request-fields.patch", result.stdout)
         verified = self.install("--verify")
         self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
-        self.assertIn("all twelve applied", verified.stdout)
+        self.assertIn("all thirteen applied", verified.stdout)
         self.assertEqual(self.install().returncode, 0)
         self.assertEqual(after, self.hashes())
 
@@ -147,6 +153,11 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(
             {path for path in before if before[path] != after[path]},
             {"python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py",
+             "python/sglang/srt/managers/scheduler.py",
+             "python/sglang/srt/mem_cache/allocation.py",
+             "python/sglang/srt/mem_cache/memory_pool.py",
+             "python/sglang/srt/mem_cache/unified_cache/components/full_component.py",
+             "python/sglang/srt/mem_cache/unified_radix_cache.py",
              "python/sglang/srt/server_args.py",
              "test/registered/unit/mem_cache/test_mamba_path_state_cap.py",
              "test/registered/unit/mem_cache/test_mamba_eviction_thinning.py"},
@@ -165,12 +176,19 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(
             {path for path in before if before[path] != after[path]},
             {"python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py",
+             "python/sglang/srt/managers/scheduler.py",
+             "python/sglang/srt/mem_cache/allocation.py",
+             "python/sglang/srt/mem_cache/memory_pool.py",
+             "python/sglang/srt/mem_cache/unified_cache/components/full_component.py",
+             "python/sglang/srt/mem_cache/unified_radix_cache.py",
              "python/sglang/srt/server_args.py",
              "test/registered/unit/mem_cache/test_mamba_path_state_cap.py"},
         )
         self.assertEqual(set(after) - set(before), {
             "test/registered/unit/mem_cache/test_mamba_path_cap_coverage.py",
-            "test/manual/mem_cache/benchmark_mamba_path_cap.py"})
+            "test/manual/mem_cache/benchmark_mamba_path_cap.py",
+            "python/sglang/srt/mem_cache/unified_cache/history.py",
+            "test/registered/unit/mem_cache/test_cache_history.py"})
         self.assertEqual(self.install("--verify").returncode, 0)
         self.assertEqual(self.install().returncode, 0)
         self.assertEqual(after, self.hashes())
@@ -178,6 +196,40 @@ class InstallTests(unittest.TestCase):
     def test_partial_coverage_patch_rejected(self):
         self.apply_prefix(12)
         (self.tree / "test/registered/unit/mem_cache/test_mamba_path_cap_coverage.py").unlink()
+        self.assert_rejected_unchanged()
+
+    def test_twelve_patch_upgrade_only_adds_cache_history(self):
+        self.apply_prefix(12)
+        before = self.hashes()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("0013-kv-mamba-cache-history.patch", result.stdout)
+        after = self.hashes()
+        self.assertEqual(
+            {path for path in before if before[path] != after[path]},
+            {
+                "python/sglang/srt/managers/scheduler.py",
+                "python/sglang/srt/mem_cache/allocation.py",
+                "python/sglang/srt/mem_cache/memory_pool.py",
+                "python/sglang/srt/mem_cache/unified_cache/components/full_component.py",
+                "python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py",
+                "python/sglang/srt/mem_cache/unified_radix_cache.py",
+            },
+        )
+        self.assertEqual(
+            set(after) - set(before),
+            {
+                "python/sglang/srt/mem_cache/unified_cache/history.py",
+                "test/registered/unit/mem_cache/test_cache_history.py",
+            },
+        )
+        self.assertEqual(self.install("--verify").returncode, 0)
+        self.assertEqual(self.install().returncode, 0)
+        self.assertEqual(after, self.hashes())
+
+    def test_partial_cache_history_patch_rejected(self):
+        self.apply_prefix(13)
+        (self.tree / "test/registered/unit/mem_cache/test_cache_history.py").unlink()
         self.assert_rejected_unchanged()
 
     def test_modified_coverage_score_rejected(self):

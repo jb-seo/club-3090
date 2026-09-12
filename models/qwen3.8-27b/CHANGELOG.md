@@ -2,6 +2,19 @@
 
 Dated history for Qwen3.8-27B configs in this repo. Append-only — add a new entry, don't rewrite past ones.
 
+## 2026-09-12 — Add persistent KV/Mamba cache history
+
+Append `0013` after the existing twelve SGLang patches. It records correlated
+KV leaf eviction, Mamba allocation/checkpoint/eviction, request cache
+operations and 30-second radix-tree/pool snapshots as per-process JSONL under
+`/tmp/sglang_kv_mamba_history`. Parent/depth fields preserve shared-path
+structure; logs contain no token or state contents. Rotation defaults to
+32 MiB with four backups, CUDA slot IDs stay disabled to avoid synchronization,
+and environment variables control the path, interval, size and node bound.
+I/O failure disables only the recorder. Runtime CPU cache tests and installer
+fresh/upgrade/drift tests cover delivery; TP2 serving overhead remains to be
+measured on the target rig.
+
 ## 2026-09-11 — Bound Mamba checkpoints by replay coverage
 
 Append `0012` after the existing eleven patches. The per-path insertion cap

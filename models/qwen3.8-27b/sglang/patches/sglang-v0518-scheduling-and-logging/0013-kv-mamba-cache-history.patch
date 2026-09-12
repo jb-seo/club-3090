@@ -1,0 +1,997 @@
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index adb7968..f6c7cd4 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1772,6 +1772,11 @@ class Scheduler(
+         with self.device_module.StreamContext(self.schedule_stream):
+             dispatch_event_loop(self)
+ 
++    def _maybe_record_cache_history(self) -> None:
++        record = getattr(self.tree_cache, "maybe_record_history", None)
++        if record is not None:
++            record([*self.running_batch.reqs, *self.waiting_queue])
++
+     def _apply_war_barrier(self):
+         # WAR: keep later schedule_stream writes behind this forward's shared reads.
+         # Clearing matters: a phase that skips the publish then falls back to coarse.
+@@ -1795,6 +1800,7 @@ class Scheduler(
+             # Receive requests
+             recv_reqs = self.request_receiver.recv_requests()
+             self.process_input_requests(recv_reqs)
++            self._maybe_record_cache_history()
+             if self._engine_paused:
+                 continue
+ 
+@@ -1839,6 +1845,7 @@ class Scheduler(
+             # Receive requests
+             recv_reqs = self.request_receiver.recv_requests()
+             self.process_input_requests(recv_reqs)
++            self._maybe_record_cache_history()
+             if self._engine_paused:
+                 continue
+ 
+diff --git a/python/sglang/srt/mem_cache/allocation.py b/python/sglang/srt/mem_cache/allocation.py
+index f1963f7..33d8ed8 100644
+--- a/python/sglang/srt/mem_cache/allocation.py
++++ b/python/sglang/srt/mem_cache/allocation.py
+@@ -271,10 +271,21 @@ def alloc_req_slots(
+         mamba_state_needed = mamba_slots_needed(
+             req_to_token_pool=req_to_token_pool, reqs=reqs
+         )
++        mamba_eviction_needed = max(0, mamba_state_needed - mamba_available_size)
++        history = getattr(tree_cache, "history", None)
++        if history:
++            history.event(
++                "mamba_alloc_demand",
++                request_ids=[getattr(req, "rid", None) for req in reqs],
++                needed_states=mamba_state_needed,
++                available_states=mamba_available_size,
++                eviction_needed=mamba_eviction_needed,
++            )
+         if mamba_available_size < mamba_state_needed:
+             if tree_cache is not None and tree_cache.supports_mamba():
+-                mamba_num = max(0, mamba_state_needed - mamba_available_size)
+-                tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
++                tree_cache.evict(
++                    EvictParams(num_tokens=0, mamba_num=mamba_eviction_needed)
++                )
+     req_pool_indices = req_to_token_pool.alloc(reqs)
+     if req_pool_indices is None:
+         raise RuntimeError(
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index 420fa25..5b0fb97 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -1315,7 +1315,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
+ 
+         mamba_indices: list[torch.Tensor] = []
+         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
++        mamba_was_new: list[bool] = []
+         for req in reqs:
++            was_new = req.mamba_pool_idx is None
+             if req.mamba_pool_idx is not None:  # for radix cache / continuing chunked
+                 pass
+             else:
+@@ -1337,6 +1339,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
+                 if self.mamba_pool.replayssm_cache_base is not None:
+                     self.mamba_pool.replayssm_cache_base[req.mamba_pool_idx] = 0
+                     self.mamba_pool.replayssm_is_flush[req.mamba_pool_idx] = 0
++            mamba_was_new.append(was_new)
+             mamba_indices.append(req.mamba_pool_idx)
+             if self.enable_mamba_extra_buffer:
+                 if req.mamba_ping_pong_track_buffer is None:
+@@ -1356,6 +1359,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
+             self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
+                 ping_pong_tensor
+             )
++        history = getattr(self, "cache_history", None)
++        if history:
++            for req, was_new in zip(reqs, mamba_was_new, strict=True):
++                history.request(
++                    "mamba_request_assign",
++                    req,
++                    newly_allocated=was_new,
++                    pool_available_after=self.mamba_allocator.available_size(),
++                )
+         return select_index
+ 
+     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
+@@ -1477,6 +1489,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
+     def free_mamba_cache(
+         self, req: Req, mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
+     ):
++        history = getattr(self, "cache_history", None)
++        if history:
++            history.request(
++                "mamba_request_release",
++                req,
++                keep_tracking_index=mamba_ping_pong_track_buffer_to_keep,
++            )
+         mamba_index = req.mamba_pool_idx
+         assert mamba_index is not None, "double free? mamba_index is None"
+         self.mamba_allocator.free(mamba_index.unsqueeze(0))
+diff --git a/python/sglang/srt/mem_cache/unified_cache/components/full_component.py b/python/sglang/srt/mem_cache/unified_cache/components/full_component.py
+index 3ec838c..9c20f1b 100644
+--- a/python/sglang/srt/mem_cache/unified_cache/components/full_component.py
++++ b/python/sglang/srt/mem_cache/unified_cache/components/full_component.py
+@@ -220,6 +220,16 @@ class FullComponent(TreeComponent):
+             if x not in self.tree_core.evictable_device_leaves:
+                 continue
+             self._evict_device_last_node = x
++            history = getattr(getattr(self, "cache", None), "history", None)
++            if history:
++                history.node(
++                    "kv_victim_selected",
++                    self.tree_core,
++                    x,
++                    requested_tokens=self._evict_device_request_cnt,
++                    freed_before=tracker[ct],
++                    policy_priority=self.session_ref_eviction_strategy(x),
++                )
+             return x.id
+         return None
+ 
+diff --git a/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py b/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py
+index f9117d6..93b59ae 100644
+--- a/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py
++++ b/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py
+@@ -253,6 +253,15 @@ class MambaComponent(TreeComponent):
+             req.mamba_pool_idx = dst_index[0]
+         req.mamba_cow_src_index = src_index
+         req.mamba_needs_clear = False
++        history = getattr(self.cache, "history", None)
++        if history:
++            history.request(
++                "mamba_cow_assign",
++                req,
++                source_node=result.best_match_node,
++                source_slot=src_index,
++                destination_slot=req.mamba_pool_idx,
++            )
+         return result
+ 
+     def commit_insert_component_data(
+@@ -271,6 +280,11 @@ class MambaComponent(TreeComponent):
+                 params.mamba_value
+             )
+             self._emit_excess_path_states_eviction(node, cache_actions)
++            history = getattr(self.cache, "history", None)
++            if history:
++                history.node(
++                    "mamba_cache_attach", self.tree_core, node, result="new_leaf"
++                )
+             return
+         if node.component_data[self.component_type].value is None:
+             node.component_data[self.component_type].value = params.mamba_value
+@@ -284,10 +298,20 @@ class MambaComponent(TreeComponent):
+             )
+             node.last_access_time = get_and_increase_time_counter()
+             self._emit_excess_path_states_eviction(node, cache_actions)
++            history = getattr(self.cache, "history", None)
++            if history:
++                history.node(
++                    "mamba_cache_attach", self.tree_core, node, result="restore"
++                )
+             return
+         self.tree_core.lru_lists[self.component_type].reset_node_mru(node)
+         node.last_access_time = get_and_increase_time_counter()
+         result.mamba_exist = True
++        history = getattr(self.cache, "history", None)
++        if history:
++            history.node(
++                "mamba_cache_attach", self.tree_core, node, result="already_present"
++            )
+ 
+     def _emit_excess_path_states_eviction(
+         self,
+@@ -339,7 +363,27 @@ class MambaComponent(TreeComponent):
+         while len(holders) > cap:
+             node = self._choose_path_cap_victim(holders, tail)
+             if node is None:
++                history = getattr(self.cache, "history", None)
++                if history:
++                    history.node(
++                        "mamba_path_cap_blocked",
++                        self.tree_core,
++                        tail,
++                        cap=cap,
++                        holder_depths=[depth for depth, _ in holders],
++                    )
+                 break
++            history = getattr(self.cache, "history", None)
++            if history:
++                history.node(
++                    "mamba_path_cap_victim",
++                    self.tree_core,
++                    node,
++                    tail=tail.id,
++                    cap=cap,
++                    holder_depths=[depth for depth, _ in holders],
++                )
++            before = tracker[ct]
+             self.tree_core._evict_component_and_detach_lru(
+                 node,
+                 self,
+@@ -349,6 +393,13 @@ class MambaComponent(TreeComponent):
+                 tracker=tracker,
+             )
+             self.tree_core._cascade_evict(node, self, tracker, device_frees, host_frees)
++            if history:
++                history.event(
++                    "mamba_state_evict_done",
++                    node=node.id,
++                    reason="path_cap",
++                    freed_states=tracker[ct] - before,
++                )
+             holders = [
+                 (depth, holder)
+                 for depth, holder in holders
+@@ -466,6 +517,9 @@ class MambaComponent(TreeComponent):
+         self._evict_path_counts: dict[NodeId, int] = {}
+         self._evict_paths: dict[NodeId, tuple[NodeId, int]] = {}
+         self._restart_device_eviction_cursor()
++        history = getattr(getattr(self, "cache", None), "history", None)
++        if history:
++            history.event("mamba_pressure_begin", requested_states=request_cnt)
+ 
+     def _restart_device_eviction_cursor(self) -> None:
+         if self.tree_core.enable_session_radix_cache:
+@@ -573,12 +627,21 @@ class MambaComponent(TreeComponent):
+                 if self._evict_hard_pressure:
+                     return None
+                 self._evict_hard_pressure = tracker[ct] == self._evict_round_start_freed
++                history = getattr(getattr(self, "cache", None), "history", None)
++                if history:
++                    history.event(
++                        "mamba_pressure_sweep_restart",
++                        mode="hard" if self._evict_hard_pressure else "fair",
++                        freed_states=tracker[ct],
++                    )
+                 self._evict_round_start_freed = tracker[ct]
+                 self._evict_path_counts.clear()
+                 self._evict_paths.clear()
+                 self._restart_device_eviction_cursor()
+                 continue
+             x = self._evict_device_cursor
++            path_id = None
++            retained = None
+             assert x.component_data[ct].value is not None
+             if x.load_back_pending_id is not None:
+                 self._advance_device_eviction_cursor(x)
+@@ -598,9 +661,34 @@ class MambaComponent(TreeComponent):
+             if x in self.tree_core.evictable_device_leaves and (
+                 not enabled or self._can_evict_leaf_atomically(x)
+             ):
++                history = getattr(getattr(self, "cache", None), "history", None)
++                if history:
++                    history.node(
++                        "mamba_leaf_victim_selected",
++                        self.tree_core,
++                        x,
++                        mode="hard" if self._evict_hard_pressure else "fair",
++                        segment=path_id,
++                        retained_states=retained,
++                        requested_states=self._evict_device_request_cnt,
++                        freed_before=tracker[ct],
++                    )
+                 self._advance_device_eviction_cursor(x)
+                 return x.id
+             victim = self._thinning_victim(x)
++            history = getattr(getattr(self, "cache", None), "history", None)
++            if history:
++                history.node(
++                    "mamba_pressure_victim_selected",
++                    self.tree_core,
++                    victim,
++                    anchor=x.id,
++                    mode="hard" if self._evict_hard_pressure else "fair",
++                    segment=path_id,
++                    retained_states=retained,
++                    requested_states=self._evict_device_request_cnt,
++                    freed_before=tracker[ct],
++                )
+             if not self._evict_hard_pressure:
+                 self._advance_device_eviction_cursor(x)
+             if victim is not x:
+@@ -619,6 +707,7 @@ class MambaComponent(TreeComponent):
+         device_frees: dict[ComponentType, list[torch.Tensor]],
+         host_frees: dict[ComponentType, list[torch.Tensor]],
+     ) -> None:
++        before = tracker[self.component_type]
+         self.tree_core._evict_component_and_detach_lru(
+             node,
+             self,
+@@ -630,6 +719,14 @@ class MambaComponent(TreeComponent):
+         self.tree_core._cascade_evict(
+             node, self, tracker, device_frees=device_frees, host_frees=host_frees
+         )
++        history = getattr(getattr(self, "cache", None), "history", None)
++        if history:
++            history.event(
++                "mamba_state_evict_done",
++                node=node.id,
++                reason="pool_pressure",
++                freed_states=tracker[self.component_type] - before,
++            )
+ 
+     def _thinning_victim(self, x: UnifiedTreeNode) -> UnifiedTreeNode:
+         """Pick which state of the LRU-oldest node's chain to drop.
+@@ -698,6 +795,9 @@ class MambaComponent(TreeComponent):
+         self._evict_paths.clear()
+         self._evict_path_counts.clear()
+         self._evict_round_start_freed = None
++        history = getattr(getattr(self, "cache", None), "history", None)
++        if history:
++            history.event("mamba_pressure_end")
+ 
+     def acquire_component_lock(
+         self,
+@@ -836,6 +936,15 @@ class MambaComponent(TreeComponent):
+                 insert_params.mamba_value = self._commit_int8_checkpoint(active_value)
+             else:
+                 insert_params.mamba_value = active_value
++            history = getattr(self.cache, "history", None)
++            if history:
++                history.request(
++                    "mamba_checkpoint_prepare",
++                    req,
++                    checkpoint_depth=cache_len,
++                    checkpoint_slot=insert_params.mamba_value,
++                    finished=True,
++                )
+             return cache_len
+         else:
+             if cache_len is None:
+@@ -872,6 +981,15 @@ class MambaComponent(TreeComponent):
+                     translate(mamba_value_donated),
+                 )
+             insert_params.mamba_value = mamba_value_donated
++            history = getattr(self.cache, "history", None)
++            if history:
++                history.request(
++                    "mamba_checkpoint_prepare",
++                    req,
++                    checkpoint_depth=cache_len,
++                    checkpoint_slot=mamba_value_donated,
++                    finished=False,
++                )
+             return cache_len
+ 
+     def cleanup_after_caching_req(
+diff --git a/python/sglang/srt/mem_cache/unified_cache/history.py b/python/sglang/srt/mem_cache/unified_cache/history.py
+new file mode 100644
+index 0000000..679c723
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/unified_cache/history.py
+@@ -0,0 +1,408 @@
++"""Best-effort, process-local cache history. Never reads KV/state contents.
++
++All collection runs on the scheduler thread. CUDA slot IDs are opt-in because
++materializing them on the CPU synchronizes the device. There is no tree-walking
++background thread and no distributed communication in this recorder.
++"""
++
++from __future__ import annotations
++
++import functools
++import json
++import logging
++import math
++import os
++import time
++from pathlib import Path
++
++from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
++
++logger = logging.getLogger(__name__)
++
++
++def _json_default(value):
++    if hasattr(value, "id"):
++        return value.id
++    if type(value).__module__.startswith("numpy") and hasattr(value, "item"):
++        return value.item()
++    return repr(value)
++
++
++def _best_effort(fn):
++    @functools.wraps(fn)
++    def wrapped(self, *args, **kwargs):
++        if not self.enabled:
++            return None
++        try:
++            return fn(self, *args, **kwargs)
++        except Exception as exc:
++            self.close()
++            logger.warning("Cache history disabled after %s: %s", fn.__name__, exc)
++            return None
++
++    return wrapped
++
++
++def history_operation(name):
++    """Correlate nested cache operations without retaining request objects."""
++
++    def decorate(fn):
++        @functools.wraps(fn)
++        def wrapped(self, *args, **kwargs):
++            history = getattr(self, "history", None)
++            if not history:
++                return fn(self, *args, **kwargs)
++            previous = history.context
++            history.begin(name, args, kwargs)
++            try:
++                result = fn(self, *args, **kwargs)
++            except BaseException as exc:
++                history.event(
++                    name + "_end", status="error", error_type=type(exc).__name__
++                )
++                raise
++            else:
++                history.end(name, result, owner=self)
++                return result
++            finally:
++                history.context = previous
++
++        return wrapped
++
++    return decorate
++
++
++class CacheHistory:
++    def __init__(
++        self,
++        directory,
++        *,
++        tp_rank=0,
++        pp_rank=0,
++        interval=30.0,
++        max_bytes=32 * 1024 * 1024,
++        backups=4,
++        max_nodes=10000,
++        slots=False,
++    ):
++        self.enabled = True
++        self.context = {}
++        self.sequence = 0
++        self.operation = 0
++        self.snapshot = 0
++        self.next_snapshot = 0.0
++        self.interval = interval
++        self.max_bytes = max_bytes
++        self.backups = backups
++        self.max_nodes = max_nodes
++        self.slots = slots
++        self.file = None
++        self.bytes_written = 0
++        self.identity = dict(pid=os.getpid(), tp=tp_rank, pp=pp_rank)
++        self.path = Path(directory) / (
++            f"cache-tp{tp_rank}-pp{pp_rank}-pid{os.getpid()}-{time.time_ns()}.jsonl"
++        )
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        self.event(
++            "history_start",
++            schema=1,
++            interval_seconds=interval,
++            max_bytes=max_bytes,
++            backups=backups,
++            max_nodes=max_nodes,
++            cuda_slot_ids=slots,
++        )
++
++    @classmethod
++    def from_env(cls, **identity):
++        directory = os.environ.get(
++            "SGLANG_CACHE_HISTORY_DIR", "/tmp/sglang_kv_mamba_history"
++        )
++        if directory.lower() in ("", "0", "off", "false"):
++            return None
++        try:
++            interval = float(os.environ.get("SGLANG_CACHE_HISTORY_INTERVAL", "30"))
++            if not math.isfinite(interval) or interval <= 0:
++                raise ValueError("SGLANG_CACHE_HISTORY_INTERVAL must be finite and > 0")
++            history = cls(
++                directory,
++                **identity,
++                interval=interval,
++                max_bytes=max(
++                    1024,
++                    int(os.environ.get("SGLANG_CACHE_HISTORY_MAX_MB", "32"))
++                    * 1024
++                    * 1024,
++                ),
++                backups=max(
++                    1, int(os.environ.get("SGLANG_CACHE_HISTORY_BACKUPS", "4"))
++                ),
++                max_nodes=max(
++                    1, int(os.environ.get("SGLANG_CACHE_HISTORY_MAX_NODES", "10000"))
++                ),
++                slots=os.environ.get("SGLANG_CACHE_HISTORY_SLOTS", "0") == "1",
++            )
++            if history:
++                logger.info("KV/Mamba history: %s", history.path)
++            return history
++        except Exception as exc:
++            logger.warning("Cannot initialize cache history: %s", exc)
++            return None
++
++    def __bool__(self):
++        return self.enabled
++
++    def close(self):
++        self.enabled = False
++        if self.file is not None:
++            try:
++                self.file.close()
++            except Exception:
++                pass
++            self.file = None
++
++    def _rotate(self):
++        if self.file is not None:
++            self.file.close()
++            self.file = None
++        for index in range(self.backups, 0, -1):
++            src = self.path if index == 1 else Path(f"{self.path}.{index - 1}")
++            if src.exists():
++                src.replace(f"{self.path}.{index}")
++        self.bytes_written = 0
++
++    @_best_effort
++    def event(self, event, **fields):
++        row = dict(
++            ts=time.time(),
++            monotonic=time.monotonic(),
++            **self.identity,
++            seq=self.sequence,
++            event=event,
++            **self.context,
++        )
++        row.update(fields)
++        line = (
++            json.dumps(
++                row,
++                ensure_ascii=False,
++                separators=(",", ":"),
++                default=_json_default,
++            )
++            + "\n"
++        )
++        size = len(line.encode("utf-8"))
++        if self.bytes_written and self.bytes_written + size > self.max_bytes:
++            self._rotate()
++        if self.file is None:
++            self.file = self.path.open("a", encoding="utf-8", buffering=1)
++        self.file.write(line)
++        self.bytes_written += size
++        self.sequence += 1
++
++    def value(self, value):
++        if value is None:
++            return None
++        count = value.numel() if hasattr(value, "numel") else len(value)
++        info = {"count": count}
++        device = getattr(value, "device", None)
++        if device is None:
++            info["ids"] = list(value)
++        elif device.type == "cpu" or self.slots:
++            info["ids"] = value.reshape(-1).tolist()
++        else:
++            info["ids_omitted"] = "cuda_sync_disabled"
++        return info
++
++    @_best_effort
++    def request(self, event, req, **fields):
++        for key, value in list(fields.items()):
++            if hasattr(value, "numel"):
++                fields[key] = self.value(value)
++        self.event(
++            event,
++            rid=getattr(req, "rid", None),
++            req_pool_idx=getattr(req, "req_pool_idx", None),
++            active=self.value(getattr(req, "mamba_pool_idx", None)),
++            tracking=self.value(getattr(req, "mamba_ping_pong_track_buffer", None)),
++            track_depth=getattr(req, "mamba_last_track_seqlen", None),
++            **fields,
++        )
++
++    def node_info(self, core, node, depth=None):
++        path_nodes = None
++        if depth is None:
++            depth = 0
++            ancestor = node
++            path_nodes = []
++            while ancestor is not None:
++                path_nodes.append(ancestor.id)
++                if ancestor is not core.root_node:
++                    depth += len(ancestor.key)
++                ancestor = ancestor.parent
++            path_nodes.reverse()
++        components = {}
++        for ct in core.component_types:
++            cd = node.component_data[ct]
++            data = dict(
++                device_count=0 if cd.value is None else len(cd.value),
++                host_count=0 if cd.host_value is None else len(cd.host_value),
++                lock_ref=cd.lock_ref,
++                host_lock_ref=cd.host_lock_ref,
++                session_ref=cd.session_ref,
++                session_ids=sorted(cd.session_ids or ()),
++            )
++            if ct == ComponentType.MAMBA:
++                data.update(
++                    device_slots=self.value(cd.value),
++                    host_slots=self.value(cd.host_value),
++                    reused=bool(cd.metadata.get("mamba_reused")),
++                )
++            components[ct.name] = data
++        result = dict(
++            node=node.id,
++            parent=node.parent.id if node.parent else None,
++            depth=depth,
++            edge_tokens=len(node.key),
++            token_range=[depth - len(node.key), depth],
++            children=len(node.children),
++            lru_tick=node.last_access_time,
++            creation_tick=node.creation_time,
++            hit_count=node.hit_count,
++            priority=node.priority,
++            device_leaf=node in core.evictable_device_leaves,
++            host_leaf=node in core.evictable_host_leaves,
++            load_back_pending=node.load_back_pending_id,
++            write_through_pending=node.write_through_pending_id,
++            components=components,
++        )
++        if path_nodes is not None:
++            result["path_nodes"] = path_nodes
++        return result
++
++    @_best_effort
++    def node(self, event, core, node, **fields):
++        self.event(event, **self.node_info(core, node), **fields)
++
++    @_best_effort
++    def begin(self, name, args, kwargs):
++        self.operation += 1
++        context = dict(
++            self.context, op=self.operation, parent_op=self.context.get("op")
++        )
++        arg = args[0] if args else kwargs.get("req", kwargs.get("params"))
++        req = getattr(arg, "req", arg)
++        if getattr(req, "rid", None) is not None:
++            context["rid"] = req.rid
++        self.context = context
++        fields = {}
++        for field in (
++            "num_tokens",
++            "mamba_num",
++            "swa_num_tokens",
++            "chunked",
++            "cow_mamba",
++        ):
++            if hasattr(arg, field):
++                fields[field] = getattr(arg, field)
++        self.event(name + "_begin", **fields)
++
++    @_best_effort
++    def end(self, name, result, owner=None):
++        fields = {}
++        for field in (
++            "num_tokens_evicted",
++            "mamba_num_evicted",
++            "swa_num_tokens_evicted",
++            "prefix_len",
++            "total_len",
++            "last_device_node",
++            "best_match_node",
++            "host_hit_length",
++            "full_kv_hit_length",
++            "mamba_host_hit_length",
++            "mamba_branching_seqlen",
++            "mamba_exist",
++        ):
++            if hasattr(result, field):
++                fields[field] = getattr(result, field)
++        if owner is not None and hasattr(owner, "tree_core"):
++            node_ref = fields.get("last_device_node", fields.get("best_match_node"))
++            if node_ref is not None:
++                node = (
++                    node_ref
++                    if hasattr(node_ref, "component_data")
++                    else owner.tree_core.node_by_id(node_ref)
++                )
++                fields["result_node"] = self.node_info(owner.tree_core, node)
++        self.event(name + "_end", status="ok", **fields)
++
++    def due(self):
++        return self.enabled and time.monotonic() >= self.next_snapshot
++
++    def pools(self, cache):
++        result = {}
++        pool = cache.req_to_token_pool
++        for name, allocator in (
++            ("kv", cache.token_to_kv_pool_allocator),
++            ("mamba", getattr(pool, "mamba_allocator", None)),
++            ("mamba_int8", getattr(pool, "mamba_ckpt_pool", None)),
++        ):
++            if allocator is not None:
++                data = {"available": allocator.available_size()}
++                if hasattr(allocator, "schedulable_available_size"):
++                    data["schedulable_available"] = (
++                        allocator.schedulable_available_size()
++                    )
++                result[name] = data
++        return result
++
++    @_best_effort
++    def maybe_snapshot(self, cache, requests=(), *, force=False):
++        if not force and not self.due():
++            return
++        self.next_snapshot = time.monotonic() + self.interval
++        self.snapshot += 1
++        sid = self.snapshot
++        core = cache.tree_core
++        self.event(
++            "snapshot_begin",
++            snapshot=sid,
++            root=core.root_node.id,
++            pools=self.pools(cache),
++            evictable={ct.name: n for ct, n in core.component_evictable_size_.items()},
++            protected={ct.name: n for ct, n in core.component_protected_size_.items()},
++            device_leaves=len(core.evictable_device_leaves),
++            host_leaves=len(core.evictable_host_leaves),
++        )
++        count = 0
++        stack = [(core.root_node, 0)]
++        while stack and count < self.max_nodes:
++            node, depth = stack.pop()
++            self.event(
++                "snapshot_node", snapshot=sid, **self.node_info(core, node, depth)
++            )
++            count += 1
++            stack.extend(
++                (child, depth + len(child.key)) for child in node.children.values()
++            )
++        # Snapshot request rows describe scheduler-visible live/queued requests;
++        # they are not an assertion of exclusive ownership of shared prefixes.
++        seen = set()
++        for req in requests:
++            if id(req) not in seen:
++                self.request(
++                    "snapshot_request",
++                    req,
++                    snapshot=sid,
++                    last_node=getattr(req, "last_node", None),
++                    kv_committed_len=getattr(req, "kv_committed_len", None),
++                )
++                seen.add(id(req))
++        self.event(
++            "snapshot_end",
++            snapshot=sid,
++            nodes=count,
++            truncated=bool(stack),
++            requests=len(seen),
++        )
+diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
+index 3db4fa3..8c94b22 100644
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
+@@ -59,6 +59,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
+     SWAComponent,
+     TreeComponent,
+ )
++from sglang.srt.mem_cache.unified_cache.history import CacheHistory, history_operation
+ from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
+     UnifiedSessionRefTracker,
+ )
+@@ -215,6 +216,11 @@ class UnifiedRadixCache(BasePrefixCache):
+             if self.tp_group is None
+             else torch.distributed.get_world_size(group=self.tp_group)
+         )
++        self.tp_rank = (
++            0
++            if self.tp_group is None
++            else torch.distributed.get_rank(group=self.tp_group)
++        )
+         self.pp_rank = params.pp_rank
+         self.pp_size = params.pp_size
+         self.work_list: list[torch.distributed.Work] = []
+@@ -228,7 +234,13 @@ class UnifiedRadixCache(BasePrefixCache):
+         self.prefetch_timeout_per_page = 0.25
+         self.hicache_storage_pass_prefix_keys = False
+ 
++        self.history = CacheHistory.from_env(tp_rank=self.tp_rank, pp_rank=self.pp_rank)
++        # The request pool owns execution-state allocation, so expose the same
++        # process-local recorder there without introducing a cache dependency.
++        self.req_to_token_pool.cache_history = self.history
+         self.reset()
++        if self.history:
++            self.history.maybe_snapshot(self, force=True)
+         logger.info(
+             f"Init Unified Radix Cache. Components: {self.tree_components}. "
+             f"Tree Core: {type(self.tree_core).__name__}"
+@@ -302,6 +314,13 @@ class UnifiedRadixCache(BasePrefixCache):
+ 
+     def reset(self) -> None:
+         self._reset_full()
++        if self.history:
++            self.history.event("cache_reset", root=self.tree_core.root_node.id)
++
++    def maybe_record_history(self, requests=(), *, force: bool = False) -> None:
++        """Emit a bounded periodic tree/pool snapshot when history is enabled."""
++        if self.history:
++            self.history.maybe_snapshot(self, requests, force=force)
+ 
+     def _reset_full(self) -> None:
+         """Full reset: destroy entire tree and all state."""
+@@ -415,6 +434,7 @@ class UnifiedRadixCache(BasePrefixCache):
+         if self.host_pool_group is not None:
+             self.host_pool_group.destroy()
+ 
++    @history_operation("match_prefix")
+     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+         result = self.session.try_match_prefix(params)
+         if result is not None:
+@@ -434,6 +454,7 @@ class UnifiedRadixCache(BasePrefixCache):
+     def is_chunk_cache(self) -> bool:
+         return self.disable
+ 
++    @history_operation("insert")
+     def insert(self, params: InsertParams) -> InsertResult:
+         if self.disable:
+             return InsertResult(prefix_len=0)
+@@ -453,6 +474,7 @@ class UnifiedRadixCache(BasePrefixCache):
+             # Drain still-pending actions so frees reach the allocator on abort.
+             self._apply_cache_actions(self.tree_core.end_insert())
+ 
++    @history_operation("evict")
+     def evict(self, params: EvictParams) -> EvictResult:
+         if self.disable:
+             return EvictResult()
+@@ -516,9 +538,24 @@ class UnifiedRadixCache(BasePrefixCache):
+     ) -> Optional[BackupKV]:
+         """Evict one device leaf, consuming its step result; returns the
+         deferred write-back BackupKV when one must run before the demote."""
++        node = self.tree_core.node_by_id(node_id)
++        before = self.history.node_info(self.tree_core, node) if self.history else None
++        was_backuped = node.backuped
+         result = self.tree_core.evict_device_leaf(node_id, self.is_write_back)
+         self._free_values(result.device_frees, result.host_frees)
+         self._accumulate_tracker(tracker, result.tracker)
++        if self.history:
++            action = (
++                "backup_pending"
++                if result.backup_kv is not None
++                else "demote" if was_backuped else "delete"
++            )
++            self.history.event(
++                "kv_evict_done",
++                victim=before,
++                action=action,
++                freed={ct.name: n for ct, n in result.tracker.items()},
++            )
+         return result.backup_kv
+ 
+     def _demote(self, node_id: NodeId, tracker: dict[ComponentType, int]) -> None:
+@@ -526,6 +563,12 @@ class UnifiedRadixCache(BasePrefixCache):
+         result = self.tree_core.demote(node_id)
+         self._free_values(result.device_frees, result.host_frees)
+         self._accumulate_tracker(tracker, result.tracker)
++        if self.history:
++            self.history.event(
++                "kv_demote_done",
++                node=node_id,
++                freed={ct.name: n for ct, n in result.tracker.items()},
++            )
+ 
+     def _drop_subtree_no_host(
+         self, node_id: NodeId, tracker: dict[ComponentType, int]
+@@ -656,6 +699,7 @@ class UnifiedRadixCache(BasePrefixCache):
+             return DecLockRefResult()
+         return self.tree_core.dec_host_lock_ref(node_id, params)
+ 
++    @history_operation("cache_finished_req")
+     def cache_finished_req(
+         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
+     ) -> None:
+@@ -749,6 +793,7 @@ class UnifiedRadixCache(BasePrefixCache):
+             ):
+                 self.session_refs.register_session_ref(req)
+ 
++    @history_operation("cache_unfinished_req")
+     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
+         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
+             return
+diff --git a/test/registered/unit/mem_cache/test_cache_history.py b/test/registered/unit/mem_cache/test_cache_history.py
+new file mode 100644
+index 0000000..b5bff6d
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_cache_history.py
+@@ -0,0 +1,86 @@
++"""CPU coverage for the opt-out cache history recorder."""
++
++import json
++import tempfile
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++
++from test_mamba_eviction_fairness import _append_path, _evict, _tree
++
++from sglang.srt.mem_cache.unified_cache.history import CacheHistory
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=2, suite="base-a-test-cpu")
++
++
++class _Allocator:
++    def __init__(self, available):
++        self.available = available
++
++    def available_size(self):
++        return self.available
++
++
++class TestCacheHistory(unittest.TestCase):
++    def test_snapshot_and_mamba_eviction_are_correlated_jsonl(self):
++        core, mamba = _tree()
++        path = _append_path(core, [20, 20, 20])
++
++        with tempfile.TemporaryDirectory() as directory:
++            history = CacheHistory(
++                directory,
++                tp_rank=1,
++                pp_rank=0,
++                interval=30,
++                max_bytes=1024 * 1024,
++                backups=2,
++                max_nodes=100,
++            )
++            cache = SimpleNamespace(
++                history=history,
++                tree_core=core,
++                token_to_kv_pool_allocator=_Allocator(123),
++                req_to_token_pool=SimpleNamespace(
++                    mamba_allocator=_Allocator(7), mamba_ckpt_pool=None
++                ),
++            )
++            mamba.cache = cache
++
++            history.maybe_snapshot(cache, force=True)
++            _evict(core, 1)
++            history.close()
++
++            rows = [
++                json.loads(line)
++                for line in Path(history.path).read_text(encoding="utf-8").splitlines()
++            ]
++
++        events = [row["event"] for row in rows]
++        self.assertEqual(rows[0]["event"], "history_start")
++        self.assertIn("snapshot_begin", events)
++        self.assertEqual(events.count("snapshot_node"), len(path) + 1)
++        self.assertIn("mamba_pressure_victim_selected", events)
++        self.assertIn("mamba_state_evict_done", events)
++        self.assertEqual({row["tp"] for row in rows}, {1})
++
++        snapshot = next(row for row in rows if row["event"] == "snapshot_begin")
++        self.assertEqual(snapshot["pools"]["kv"]["available"], 123)
++        victim = next(
++            row for row in rows if row["event"] == "mamba_pressure_victim_selected"
++        )
++        self.assertEqual(victim["mode"], "fair")
++        self.assertIn(victim["node"], [node.id for node in path])
++        self.assertEqual(victim["path_nodes"][0], core.root_node.id)
++        self.assertEqual(victim["token_range"][1], victim["depth"])
++
++    def test_environment_can_disable_history(self):
++        import os
++        from unittest.mock import patch
++
++        with patch.dict(os.environ, {"SGLANG_CACHE_HISTORY_DIR": "off"}):
++            self.assertIsNone(CacheHistory.from_env(tp_rank=0, pp_rank=0))
++
++
++if __name__ == "__main__":
++    unittest.main()
+

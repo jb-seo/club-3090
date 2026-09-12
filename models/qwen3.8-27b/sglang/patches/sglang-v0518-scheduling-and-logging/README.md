@@ -1,6 +1,6 @@
 # `sglang-v0518-scheduling-and-logging`
 
-Twelve patches applied to SGLang **inside the container** at startup by
+Thirteen patches applied to SGLang **inside the container** at startup by
 `install.sh`, which the compose runs before `launch_server`. Nothing to
 install on the host.
 
@@ -8,9 +8,9 @@ Base is **v0.5.18** (`71de97b264`). The compose pins `lmsysorg/sglang:v0.5.18`
 for that reason: `:latest` is already past it — as of 2026-09-04 `:latest` and
 `:v0.5.19` share a digest (`sha256:d6e72886...3eda9`).
 
-`bash install.sh --verify` reports which of the twelve are present, changing
+`bash install.sh --verify` reports which of the thirteen are present, changing
 nothing. Rerunning `install.sh` upgrades a container with a complete prefix
-of three through eleven patches by applying only the remaining patches.
+of three through twelve patches by applying only the remaining patches.
 
 ## Why patches, not a fork checkout
 
@@ -41,6 +41,7 @@ tag when moving the pin — do not force them.
 | `0010-fix-mamba-demand-v0518-request-fields.patch` | Corrects `0007` to use v0.5.18's request-level Mamba fields; fixes the first-prefill `req.kv is None` crash. Includes regression tests using real `Req` objects. |
 | `0011-mamba-inter-path-eviction-fairness.patch` | Spreads Mamba eviction across cold paths, retaining two usable checkpoints per path while possible, with a hard-pressure LRU fallback. |
 | `0012-mamba-path-cap-minimax-coverage.patch` | Changes the insertion-time per-path cap to minimize the maximum replay gap, with deterministic quantile ties and protected checkpoints. Includes unit tests and a synthetic policy A/B. |
+| `0013-kv-mamba-cache-history.patch` | Writes correlated KV/Mamba allocation, insertion and eviction events plus bounded periodic radix-tree/pool snapshots to per-process JSONL files. |
 
 `0001`–`0004` are scoped to `python/sglang/`. `0005`/`0006` retain their
 upstream tests and original format-patch author/commit metadata. Their bytes
@@ -319,6 +320,44 @@ of partial/modified `0012`. Existing `0001`–`0011` remain byte-identical.
 The [synthetic A/B report](validation/mamba-path-cap-2026-09-11.md) records
 slot occupancy, per-session geometry, partial/zero hits and replay work.
 GPU serving, numerical correctness, TP2 throughput and TTFT are unmeasured.
+
+### KV/Mamba cache history (`0013`, 2026-09-12)
+
+Each scheduler process writes JSONL history to
+`/tmp/sglang_kv_mamba_history/cache-tp{rank}-pp{rank}-pid{pid}-{start}.jsonl`.
+Operation IDs correlate nested request caching, radix insertion and exact
+eviction requests. Events cover KV leaf selection/deletion/demotion, Mamba
+allocation demand and request-slot assignment/release, checkpoint donation
+and attachment, pool-pressure fairness/hard-mode selection, and insertion-cap
+victims. Token or state contents are never written.
+
+The scheduler also records a bounded full-tree snapshot every 30 seconds.
+`snapshot_node` rows contain node/parent IDs, cumulative depth, edge length,
+LRU/creation counters, hit count, priority, locks, session references, device
+and host occupancy, and leaf/transfer state. `snapshot_begin` includes pool
+availability and per-component evictable/protected totals; running and waiting
+requests are recorded separately. The parent links reconstruct paths without
+pretending a shared prefix belongs to one request.
+
+The recorder is enabled by the patch and is best-effort: an I/O or collection
+error disables only history, not serving. It runs synchronously on the
+scheduler thread, has no background tree walker, and rotates each process file
+at 32 MiB with four backups. Tune it with:
+
+| Environment variable | Default | Meaning |
+|---|---:|---|
+| `SGLANG_CACHE_HISTORY_DIR` | `/tmp/sglang_kv_mamba_history` | Output directory; `off`, `false`, `0`, or an empty value disables history. |
+| `SGLANG_CACHE_HISTORY_INTERVAL` | `30` | Seconds between full snapshots. |
+| `SGLANG_CACHE_HISTORY_MAX_MB` | `32` | Size of each current/rotated JSONL file. |
+| `SGLANG_CACHE_HISTORY_BACKUPS` | `4` | Rotated files retained per process. |
+| `SGLANG_CACHE_HISTORY_MAX_NODES` | `10000` | Maximum nodes in one snapshot; `snapshot_end.truncated` reports clipping. |
+| `SGLANG_CACHE_HISTORY_SLOTS` | `0` | Set to `1` to include CUDA slot IDs. This can synchronize the GPU; leave off for normal diagnosis. |
+
+`/tmp` disappears with the container. Copy the directory to persistent storage
+before recreating a RunPod, or override the directory to a persistent mount.
+CPU validation covers valid JSONL snapshots and correlated Mamba eviction;
+the existing cache suite passes 57 CPU tests plus five GPU-only skips. The
+recorder has not yet been profiled under TP2 production load.
 
 ## DFlash2 backports (`0005` / `0006`)
 
