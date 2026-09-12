@@ -29,8 +29,22 @@ The default model is the profile's AutoRound INT4 HF repository, currently
 `HF_HOME=/workspace/cache/huggingface`. An existing `/models/target/config.json`
 or `/workspace/models/qwen3.8-27b-autoround-int4/config.json` takes precedence.
 Set `MODEL_PATH` to use another local directory or HF model ID. JIT caches
-use `/workspace/cache/sglang`. Point `WORKSPACE_DIR` at your persistent volume
-if it is mounted elsewhere; existing `HF_HOME` and `SGLANG_CACHE_DIR` win.
+use `/workspace/cache/sglang`.
+
+HiCache is enabled with the stock image's built-in `file` backend. Because
+Qwen3.8 uses one host/file pool per TP rank, the compose assigns **1 GB L2 RAM
+and 10 GB L3 per rank**: TP=2 gives about 2 GB of host cache and a strict
+20 GB disk-cache ceiling for the server. Write-through keeps L3 populated while
+the small L2 acts as its staging cache. L3 defaults to
+`/workspace/cache/sglang/hicache-file` on RunPod and to the compose's
+`SGLANG_CACHE_DIR/hicache-file` on Docker. Point `WORKSPACE_DIR` at your
+persistent volume if it is mounted elsewhere; existing `HF_HOME`,
+`SGLANG_CACHE_DIR` and `SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR` win.
+
+`SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE` is a **per-rank** override, so keep it
+at `10G` for a 20 GB TP=2 total. The v0.5.18 size parser accepts `10G` (decimal)
+and `10Gi` (binary), but not `10GB`. Changing `TP_SIZE` also changes the total
+RAM and disk budget unless `--hicache-size` and this per-rank cap are adjusted.
 
 Defaults retain the compose's TP=2, PCIe communication settings, built-in
 EAGLE/MTP drafter and HTTP port **30000**. Expose that port in the Pod template;

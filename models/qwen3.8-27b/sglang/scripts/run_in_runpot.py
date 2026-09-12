@@ -24,6 +24,15 @@ SERVICE = "sglang-qwen38-27b-mtp-dual"
 def launch_config(root, environ, extra_args):
     """Keep compose argv intact except container paths and explicit overrides."""
     env = dict(environ)
+    workspace = Path(env.get("WORKSPACE_DIR", "/workspace"))
+    env.setdefault("HF_HOME", str(workspace / "cache/huggingface"))
+    env.setdefault("SGLANG_CACHE_DIR", str(workspace / "cache/sglang"))
+    # The compose default is the cache volume's in-container path. RunPod has
+    # no compose mount, so place L3 on its persistent workspace by default.
+    env.setdefault(
+        "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR",
+        str(Path(env["SGLANG_CACHE_DIR"]) / "hicache-file"),
+    )
     service = yaml.safe_load((root / COMPOSE).read_text(encoding="utf-8"))["services"][SERVICE]
     command = service["command"]
     if len(command) < 3 or command[1] != "--" or "sglang.launch_server" not in command[0]:
@@ -41,7 +50,6 @@ def launch_config(root, environ, extra_args):
         else:
             env.setdefault(key, value)
 
-    workspace = Path(env.get("WORKSPACE_DIR", "/workspace"))
     model = env.get("MODEL_PATH")
     if not model:
         candidates = (
@@ -60,8 +68,6 @@ def launch_config(root, environ, extra_args):
     args = [f"{arg.split('=', 1)[0]}={overrides[arg.split('=', 1)[0]]}"
             if arg.split("=", 1)[0] in overrides else arg for arg in args]
     args.extend(extra_args)
-    env.setdefault("HF_HOME", str(workspace / "cache/huggingface"))
-    env.setdefault("SGLANG_CACHE_DIR", str(workspace / "cache/sglang"))
     env.setdefault("SGLANG_DIR", "/sgl-workspace/sglang")
     # The installer patches this source; make sure launch_server imports it.
     source_python = str(Path(env["SGLANG_DIR"]) / "python")
@@ -102,7 +108,16 @@ def main():
     args, env = launch_config(ROOT, os.environ, extra)
     installer = ROOT / PATCHES / "install.sh"
     print(f"[runpod] Compose: {ROOT / COMPOSE}", flush=True)
-    for key in ("SGLANG_DIR", "HF_HOME", "SGLANG_CACHE_DIR", "NCCL_P2P_DISABLE", "PYTORCH_CUDA_ALLOC_CONF"):
+    for key in (
+        "SGLANG_DIR",
+        "HF_HOME",
+        "SGLANG_CACHE_DIR",
+        "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR",
+        "SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE",
+        "SGLANG_HICACHE_FILE_BACKEND_EVICTION_RATIO",
+        "NCCL_P2P_DISABLE",
+        "PYTORCH_CUDA_ALLOC_CONF",
+    ):
         print(f"[runpod] {key}={env[key]}", flush=True)
     # CLI can include an API key; display a redacted copy only.
     display = []
@@ -115,7 +130,11 @@ def main():
     if dry_run:
         return
     preflight(args, env)
-    for key in ("HF_HOME", "SGLANG_CACHE_DIR"):
+    for key in (
+        "HF_HOME",
+        "SGLANG_CACHE_DIR",
+        "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR",
+    ):
         Path(env[key]).mkdir(parents=True, exist_ok=True)
     subprocess.run(["bash", str(installer)], env=env, check=True, stdin=subprocess.DEVNULL)
     print("[runpod] Starting SGLang in foreground; missing HF weights download into HF_HOME.", flush=True)

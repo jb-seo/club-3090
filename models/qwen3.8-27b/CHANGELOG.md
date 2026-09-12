@@ -2,6 +2,19 @@
 
 Dated history for Qwen3.8-27B configs in this repo. Append-only — add a new entry, don't rewrite past ones.
 
+## 2026-09-12 — Enable bounded L2/L3 HiCache for SGLang
+
+Enable HiCache in the dual-3090 SGLang compose using v0.5.18's dependency-free
+`file` backend. The TP=2 server allocates 1 GB of host cache per rank (about
+2 GB total) and caps each rank's file cache at 10 GB (20 GB total), with
+write-through from the small L2 staging pool. Docker persists L3 below the
+existing SGLang cache mount; the RunPod launcher maps it to
+`/workspace/cache/sglang/hicache-file` and exposes path/cap overrides.
+
+CPU-only launcher tests cover compose parity, defaults and explicit HiCache
+environment overrides. GPU startup, L3 hit latency and workload throughput
+remain to be measured on the target rig.
+
 ## 2026-09-12 — Add persistent KV/Mamba cache history
 
 Append `0013` after the existing twelve SGLang patches. It records correlated

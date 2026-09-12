@@ -8,6 +8,8 @@
 #              head; NO external drafter model). Measured accept-len 2.3-3.4,
 #              accept-rate 0.44-0.80.
 #   KV:        fp8_e4m3
+#   HiCache:   L2 host RAM 2 GB total (1 GB/rank); L3 file cache 20 GB cap
+#              total (10 GB/rank), persisted under SGLANG_CACHE_DIR
 #   Vision:    input path present (--image-processor-backend pil, see Caveats)
 #   Max ctx:   100K+ exercised; architectural ceiling not probed here
 #   Genesis:   N/A — Genesis is vLLM-specific
@@ -182,6 +184,12 @@ services:
       # Disable custom all-reduce on PCIe-only Ampere — see CLAUDE.md
       NCCL_P2P_DISABLE: "${NCCL_P2P_DISABLE:-1}"
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      # HiCache pools and file eviction are per TP rank for this non-MLA model.
+      # TP=2 therefore gives a 20 GB server-wide L3 cap. Use SI suffixes: the
+      # v0.5.18 parser accepts 10G/10Gi, but not 10GB.
+      SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR: "${SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR:-/root/.cache/sglang/hicache-file}"
+      SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE: "${SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE:-10G}"
+      SGLANG_HICACHE_FILE_BACKEND_EVICTION_RATIO: "${SGLANG_HICACHE_FILE_BACKEND_EVICTION_RATIO:-0.9}"
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
@@ -201,6 +209,17 @@ services:
       # Triton regardless; see the header.
       - --attention-backend=flashinfer
       - --kv-cache-dtype=fp8_e4m3
+      # --- hierarchical cache ---------------------------------------------
+      # --hicache-size is also per TP rank. 1 GB/rank keeps L2 as a small
+      # staging cache (2 GB total) while write-through retains pages in L3.
+      # The built-in file backend works in the untouched v0.5.18 image; the
+      # reference deploy's NIXL backend needs packages absent from that image.
+      - --enable-hierarchical-cache
+      - --hicache-size=1
+      - --hicache-write-policy=write_through
+      - --hicache-io-backend=kernel
+      - --hicache-mem-layout=page_first
+      - --hicache-storage-backend=file
       # --- speculative decoding (built-in MTP head, no external drafter) ----
       - --speculative-algorithm=EAGLE
       - --speculative-num-steps=2

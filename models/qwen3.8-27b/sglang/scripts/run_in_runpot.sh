@@ -25,7 +25,11 @@ Environment:
   TP_SIZE / PORT      Override compose TP=2 / port=30000
   SGLANG_DIR         Image source tree (default: /sgl-workspace/sglang)
   HF_HOME            Hugging Face cache (default: /workspace/cache/huggingface)
-  SGLANG_CACHE_DIR   JIT cache (default: /workspace/cache/sglang)
+  SGLANG_CACHE_DIR   JIT cache and L3 parent (default: /workspace/cache/sglang)
+  SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR
+                     L3 file cache (default: SGLANG_CACHE_DIR/hicache-file)
+  SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE
+                     Per-rank L3 cap (default: 10G; TP=2 total: 20 GB)
 
 HF_TOKEN is honored by SGLang/Hugging Face. Export overrides before piping,
 or put `env NAME=value` on the bash side of the pipe.

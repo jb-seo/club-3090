@@ -27,6 +27,14 @@ class RunPodTests(unittest.TestCase):
         self.assertEqual(args, expected)
         self.assertEqual(env["NCCL_P2P_DISABLE"], "1")
         self.assertEqual(env["PYTORCH_CUDA_ALLOC_CONF"], "expandable_segments:True")
+        self.assertIn("--enable-hierarchical-cache", args)
+        self.assertIn("--hicache-size=1", args)
+        self.assertIn("--hicache-storage-backend=file", args)
+        self.assertEqual(env["SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE"], "10G")
+        self.assertEqual(
+            env["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"],
+            "/workspace/cache/sglang/hicache-file",
+        )
 
     def test_env_and_cli_overrides_preserve_argument_boundaries(self):
         args, env = runner.launch_config(runner.ROOT, {
@@ -39,6 +47,27 @@ class RunPodTests(unittest.TestCase):
         self.assertEqual(args[-3:], ["--max-running-requests=4", "--served-model-name", "custom model"])
         self.assertEqual(env["NCCL_P2P_DISABLE"], "0")
         self.assertEqual(env["HF_HOME"], "/persistent/cache/huggingface")
+        self.assertEqual(
+            env["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"],
+            "/persistent/cache/sglang/hicache-file",
+        )
+
+    def test_hicache_environment_overrides_are_preserved(self):
+        args, env = runner.launch_config(
+            runner.ROOT,
+            {
+                "MODEL_PATH": "/weights/target",
+                "SGLANG_CACHE_DIR": "/cache",
+                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": "/disk/hicache",
+                "SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE": "8Gi",
+                "SGLANG_HICACHE_FILE_BACKEND_EVICTION_RATIO": "0.8",
+            },
+            [],
+        )
+        self.assertIn("--hicache-size=1", args)
+        self.assertEqual(env["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"], "/disk/hicache")
+        self.assertEqual(env["SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE"], "8Gi")
+        self.assertEqual(env["SGLANG_HICACHE_FILE_BACKEND_EVICTION_RATIO"], "0.8")
 
     def test_profile_model_fallback_and_existing_model(self):
         profile = yaml.safe_load((runner.ROOT / runner.PROFILE).read_text(encoding="utf-8"))
