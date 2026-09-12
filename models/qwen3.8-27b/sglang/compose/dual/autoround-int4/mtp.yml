@@ -211,12 +211,13 @@ services:
       - --kv-cache-dtype=fp8_e4m3
       # --- hierarchical cache ---------------------------------------------
       # --hicache-size is also per TP rank. 1 GB/rank keeps L2 as a small
-      # staging cache (2 GB total) while write-through retains pages in L3.
+      # staging cache (2 GB total). write_back starts D->H->L3 backup only
+      # when an unlocked L1 radix leaf is selected for GPU-cache eviction.
       # The built-in file backend works in the untouched v0.5.18 image; the
       # reference deploy's NIXL backend needs packages absent from that image.
       - --enable-hierarchical-cache
       - --hicache-size=1
-      - --hicache-write-policy=write_through
+      - --hicache-write-policy=write_back
       - --hicache-io-backend=kernel
       - --hicache-mem-layout=page_first
       - --hicache-storage-backend=file

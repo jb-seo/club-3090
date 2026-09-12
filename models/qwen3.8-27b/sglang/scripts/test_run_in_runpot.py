@@ -29,6 +29,7 @@ class RunPodTests(unittest.TestCase):
         self.assertEqual(env["PYTORCH_CUDA_ALLOC_CONF"], "expandable_segments:True")
         self.assertIn("--enable-hierarchical-cache", args)
         self.assertIn("--hicache-size=1", args)
+        self.assertIn("--hicache-write-policy=write_back", args)
         self.assertIn("--hicache-storage-backend=file", args)
         self.assertEqual(env["SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE"], "10G")
         self.assertEqual(

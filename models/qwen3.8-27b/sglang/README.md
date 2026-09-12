@@ -34,9 +34,10 @@ use `/workspace/cache/sglang`.
 HiCache is enabled with the stock image's built-in `file` backend. Because
 Qwen3.8 uses one host/file pool per TP rank, the compose assigns **1 GB L2 RAM
 and 10 GB L3 per rank**: TP=2 gives about 2 GB of host cache and a strict
-20 GB disk-cache ceiling for the server. Write-through keeps L3 populated while
-the small L2 acts as its staging cache. L3 defaults to
-`/workspace/cache/sglang/hicache-file` on RunPod and to the compose's
+20 GB disk-cache ceiling for the server. The `write_back` policy begins
+GPU→L2→L3 backup when an unlocked radix leaf is selected for GPU-cache
+eviction, rather than copying newly inserted cache entries immediately. L3
+defaults to `/workspace/cache/sglang/hicache-file` on RunPod and to the compose's
 `SGLANG_CACHE_DIR/hicache-file` on Docker. Point `WORKSPACE_DIR` at your
 persistent volume if it is mounted elsewhere; existing `HF_HOME`,
 `SGLANG_CACHE_DIR` and `SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR` win.

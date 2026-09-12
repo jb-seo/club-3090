@@ -2,6 +2,14 @@
 
 Dated history for Qwen3.8-27B configs in this repo. Append-only — add a new entry, don't rewrite past ones.
 
+## 2026-09-12 — Make HiCache offload eviction-driven
+
+Switch the SGLang HiCache policy from `write_through` to `write_back` after
+observing new radix entries offload immediately. New entries now stay in GPU
+KV; selecting an unlocked radix leaf for L1 eviction triggers its backup to
+the 2 GB L2 staging pool and the bounded file-backed L3. Capacity, paths and
+the stock v0.5.18 file backend remain unchanged.
+
 ## 2026-09-12 — Enable bounded L2/L3 HiCache for SGLang
 
 Enable HiCache in the dual-3090 SGLang compose using v0.5.18's dependency-free
