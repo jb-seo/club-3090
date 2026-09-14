@@ -1248,6 +1248,54 @@ patches:
         minja implements `x.0` as `x[0]`, or the caps probe degrades gracefully instead of
         inferring nothing when a probe throws. Closest prior art: ggml-org/llama.cpp#28509
         (Gemma 4 misclassified supports_typed_content), same subsystem, closed completed.
+  - id: qwen38-sglang-mamba-demand-v0519
+    model: [qwen3.8-27b]
+    status: unverified
+    files:
+      - models/qwen3.8-27b/sglang/patches/sglang-pr38151-mamba-demand-v0.5.19
+    load_bearing_when:
+      - composes:
+          - sgl/qwen38-27b-dual-fast
+          - sgl/qwen38-27b-dual-superfast
+          - sgl/qwen38-27b-dual-max
+          - sgl/qwen38-27b-multi4-fast
+          - sgl/qwen38-27b-multi4-superfast
+          - sgl/qwen38-27b-multi4-max
+          - sgl/qwen38-27b-multi4-supermax
+          - sgl/qwen38-27b-multi8-fast
+          - sgl/qwen38-27b-multi8-superfast
+          - sgl/qwen38-27b-multi8-max
+          - sgl/qwen38-27b-multi8-supermax
+        reason: >-
+          Evicts only the Mamba slot shortfall a prefill batch will actually allocate,
+          retaining checkpoints for prefix-matched and continuing chunked requests.
+          Always installed before launch, independently of W4A8, across all 13
+          Qwen3.8-27B SGLang composes (including the two without registry slugs).
+        evidence: >-
+          docs/UPSTREAM.md SGLang #38151; alphabetc1 commit
+          ad60252754e895f857b9b8015570245f3dfc2b0a, allocation.py runtime diff unchanged.
+          Local installer checks only; live serving and performance validation pending.
+    delivery:
+      dockerfile_bake: false
+      entrypoint_invoke: true
+      genesis: false
+    delivery_gaps: []
+    delivery_mechanism: install_script
+    delivery_spec:
+      script: models/qwen3.8-27b/sglang/patches/sglang-pr38151-mamba-demand-v0.5.19/install.sh
+      mounted_at: /etc/club3090/mamba-demand
+      invoke: "bash /etc/club3090/mamba-demand/install.sh"
+      invoked_before: sglang-launch
+      wired_at: [volumes, entrypoint]
+    drift_guard:
+      kind: patch_context
+      check: "Preflight all forward hunks; verify all reverse hunks after apply or on restart. Reject partial application or context drift before launch."
+      on_fail: refuse-to-boot
+    capability: sglang-mamba-cache-retention
+    upstream:
+      ref: sgl-project/sglang#38151 (ad60252754e895f857b9b8015570245f3dfc2b0a)
+      status: open
+      drop_when: "The pinned SGLang release includes #38151 or an equivalent exact Mamba allocation-demand fix."
   - id: qwen38-sglang-autoround-w4a8-v0519
     model: [qwen3.8-27b]
     status: unverified

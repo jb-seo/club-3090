@@ -210,6 +210,7 @@ services:
     ports:
       - "${BIND_HOST:-0.0.0.0}:${ESTATE_PORT:-${PORT:-8143}}:30000"
     volumes:
+      - "../../../patches/sglang-pr38151-mamba-demand-v0.5.19:/etc/club3090/mamba-demand:ro"
       - "${MODEL_DIR:-../../../../../../models-cache}:/models:ro"
       - "${W4A8_PATCH_DIR:-../../../patches/sglang-autoround-w4a8-v0.5.19}:/etc/club3090/w4a8:ro"
     ipc: host
@@ -245,6 +246,8 @@ services:
     command:
       - |
         set -euo pipefail
+        # Mamba eviction fix; see docs/UPSTREAM.md (SGLang #38151).
+        bash /etc/club3090/mamba-demand/install.sh
         M=/models/qwen3.8-27b-autoround-int4
         # ⚠️ SPEC_N=0 removes the speculative flags entirely rather than passing
         # a zero — the same rule the MTP sibling and the GLM composes use, so a
